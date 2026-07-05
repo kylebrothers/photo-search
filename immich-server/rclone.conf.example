@@ -1,0 +1,7 @@
+# Generate this locally with `rclone config` (set up a Dropbox remote named
+# "dropbox"), then copy the resulting [dropbox] block into a real
+# rclone.conf in this folder. Never commit the real file — see .gitignore.
+
+[dropbox]
+type = dropbox
+token = {"access_token":"...","token_type":"bearer","refresh_token":"...","expiry":"..."}
