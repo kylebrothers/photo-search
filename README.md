@@ -5,7 +5,7 @@ Self-hosted natural language search over a large family photo collection stored 
 ## Platform
 
 - **Host:** Raspberry Pi 5 running off an attached SSD (Docker containers)
-- **ML offload:** Remote device on home network with a GTX 1070 GPU — deployed and managed as a **separate repo, `gpu-ml`**, since that device is expected to serve other projects over time, not just this one
+- **ML offload:** Remote device on home network with a GTX 1060 (6GB) GPU — deployed and managed as a **separate repo, `gpu-ml`**, since that device is expected to serve other projects over time, not just this one
 - **Network:** Internal home network only; no external exposure, so security hardening is out of scope for v1
 - **Photo source:** Dropbox `Apps/` subfolder, shared/edited by other family members (uncontrolled — files are added and moved outside our control)
 
@@ -37,7 +37,7 @@ The container needs `cap_add: [SYS_ADMIN]` and `/dev/fuse` (lighter than full `-
 
 Runs `immich-machine-learning` via CUDA — CLIP embedding generation and face detection/recognition, the two heaviest jobs. `immich-server` points at it over `IMMICH_MACHINE_LEARNING_URL`. Kept in its own repo because the GPU box is meant to serve more than just this project over time; see that repo's README for how to add services to it.
 
-Later (conditional, Phase 5 below), that same device could also run a local LLM via Ollama for compound query parsing, if the rule-based parser proves insufficient. No separate provisioning needed now — the 1070's 8GB VRAM is enough for a quantized 7B model when that phase happens.
+Later (conditional, Phase 5 below), that same device could also run a local LLM via Ollama for compound query parsing, if the rule-based parser proves insufficient. This is tighter than originally planned: the device has 6GB VRAM, not 8GB — a 4-bit quantized 7B model (~4–5GB) still fits, but with much less headroom, so model choice should be reassessed against actual available memory when that phase happens rather than assumed.
 
 ## Gaps Immich doesn't cover, and how we're closing them
 
@@ -67,16 +67,19 @@ photo-search/
 │   ├── entrypoint-wrapper.sh
 │   └── rclone.conf.example        # real rclone.conf is gitignored, runtime-only
 ├── search-api/
+│   ├── Dockerfile
+│   ├── requirements.txt
 │   ├── config.py
-│   ├── app.py                     # Flask entry point, /api/search
+│   ├── app.py                     # Flask entry point, / (search page), /api/search, /proxy/*
 │   ├── query_parser.py            # rule-based now; swappable for an LLM call later
-│   ├── immich_client.py           # wrapper over Immich's REST API
+│   ├── immich_client.py           # wrapper over Immich's REST API + thumbnail/download proxy
 │   ├── db.py                      # direct Postgres access, embeddings only
 │   ├── landmark/
 │   │   ├── reference_embeddings.py
 │   │   └── match.py
-│   └── requirements.txt           # not yet created
-└── scripts/                       # not yet created
+│   └── templates/
+│       └── search.html
+└── scripts/
     ├── trigger_rescan.sh
     └── check_asset_exists.py
 ```
@@ -87,8 +90,8 @@ photo-search/
 
 1. **Core infrastructure** — `immich-server` (with embedded rclone) + Postgres + Redis on the Pi; `immich-machine-learning` on the `gpu-ml` device.
 2. **Reconciliation** — scheduled library rescans; existence-check before serving downloads.
-3. **Orchestration layer (v1)** — `search-api`: rule-based query parser → combined-filter search against Immich → hand-off to Immich's viewer/download. *(Python files drafted; Dockerfile/requirements.txt still pending.)*
-4. **Landmark module** — CLIP nearest-neighbor tagging against a labeled reference set.
+3. **Orchestration layer (v1)** — `search-api`: rule-based query parser → combined-filter search against Immich → hand-off to Immich's viewer/download. *(Built — pending verification of the API/DB assumptions noted throughout this doc.)*
+4. **Landmark module** — CLIP nearest-neighbor tagging against a labeled reference set. `reference_embeddings.py`/`match.py` exist as a library; nothing yet calls `add_reference()` to actually label a photo — a CLI or route for that is still needed.
 5. **LLM query parsing (conditional)** — swap `query_parser.py`'s implementation for a local LLM on the `gpu-ml` device, only if rule-based parsing proves insufficient.
 
 Initial ML backfill over the full collection is expected to take days to weeks and is allowed to run at low priority in the background. A partial, testable index should be usable well before the full backfill completes.
