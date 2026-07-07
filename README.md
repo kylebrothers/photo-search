@@ -11,11 +11,13 @@ Self-hosted natural language search over a large family photo collection stored 
 
 ## Storage architecture
 
-Three separate storage roles, deliberately kept apart:
+Three separate storage roles, deliberately kept apart. **Deployment goal: `docker compose up` with zero host-level mount setup** — no `/etc/fstab` entries, nothing running outside containers.
 
-- **Local SSD (Pi):** Postgres data directory only. Small (gigabytes, even for a huge library) — holds embeddings, face clusters, and metadata. Must stay local: Postgres over NFS is a known-bad pattern (unreliable file locking under concurrent writes can corrupt the database), independent of NAS speed or hardware quality.
-- **NAS:** Thumbnails/previews (live, mounted via NFS) plus periodic backups (`pg_dump` snapshots + thumbnail cache copies). Thumbnails are plain image files, not a database needing POSIX locks, so NFS is fine here.
-- **Dropbox (via rclone, VFS cache):** Original photos. The library is too large to mirror locally, so Immich treats it as an external library rather than holding a local copy.
+- **Local SSD (Pi):** Postgres data directory only, as an ordinary bind mount. Small (gigabytes, even for a huge library) — holds embeddings, face clusters, and metadata. Must stay local: Postgres over NFS is a known-bad pattern (unreliable file locking under concurrent writes can corrupt the database), independent of NAS speed or hardware quality.
+- **NAS:** Thumbnails/previews, mounted as a **Docker-native NFS volume** (`driver_opts: type: nfs`, same convention as the flask-app-template repo) rather than a host-level NFS mount. Docker handles the mount itself — no host `/etc/fstab` entry needed. Thumbnails are plain image files, not a database needing POSIX locks, so NFS is fine here. Periodic backups (`pg_dump` snapshots + thumbnail cache copies) will also land on the NAS, but since the host has no direct NAS mount, backup jobs will need to run **inside a container** (e.g. a `docker compose run` job mounting the same volume) rather than as a host script — not yet built, flagging for Phase 2.
+- **Dropbox (via rclone, embedded in `immich-server`, VFS cache):** Original photos. The library is too large to mirror locally, so Immich treats it as an external library rather than holding a local copy.
+
+**Caveat on `make clean`:** it runs `docker compose down -v`, which removes the `immich_upload` volume *definition* — this does **not** delete anything on the NAS itself (NFS-backed volumes hold no local data), it only removes Docker's reference to the mount. Recreating it via `make up` reattaches to the same NAS path.
 
 ## Core stack
 
@@ -37,7 +39,9 @@ The container needs `cap_add: [SYS_ADMIN]` and `/dev/fuse` (lighter than full `-
 
 Runs `immich-machine-learning` via CUDA — CLIP embedding generation and face detection/recognition, the two heaviest jobs. `immich-server` points at it over `IMMICH_MACHINE_LEARNING_URL`. Kept in its own repo because the GPU box is meant to serve more than just this project over time; see that repo's README for how to add services to it.
 
-Later (conditional, Phase 5 below), that same device could also run a local LLM via Ollama for compound query parsing, if the rule-based parser proves insufficient. This is tighter than originally planned: the device has 6GB VRAM, not 8GB — a 4-bit quantized 7B model (~4–5GB) still fits, but with much less headroom, so model choice should be reassessed against actual available memory when that phase happens rather than assumed.
+Later (conditional, Phase 5 below), that same device could also run a local LLM via Ollama for compound query parsing, if the rule-based parser proves insufficient. The device has 6GB VRAM — a 4-bit quantized 7B model (~4–5GB) still fits, but with much less headroom than an 8GB card, so model choice should be reassessed against actual available memory when that phase happens rather than assumed.
+
+**Verified working (2026-07-07):** GPU passthrough confirmed via `nvidia-smi` inside the `immich-machine-learning` container, and the service responds on `/ping`.
 
 ## Gaps Immich doesn't cover, and how we're closing them
 
@@ -88,7 +92,7 @@ photo-search/
 
 ## Build phases
 
-1. **Core infrastructure** — `immich-server` (with embedded rclone) + Postgres + Redis on the Pi; `immich-machine-learning` on the `gpu-ml` device.
+1. **Core infrastructure** — `immich-server` (with embedded rclone) + Postgres + Redis on the Pi; `immich-machine-learning` on the `gpu-ml` device. *(`gpu-ml` deployed and GPU passthrough verified; `photo-search` side in progress.)*
 2. **Reconciliation** — scheduled library rescans; existence-check before serving downloads.
 3. **Orchestration layer (v1)** — `search-api`: rule-based query parser → combined-filter search against Immich → hand-off to Immich's viewer/download. *(Built — pending verification of the API/DB assumptions noted throughout this doc.)*
 4. **Landmark module** — CLIP nearest-neighbor tagging against a labeled reference set. `reference_embeddings.py`/`match.py` exist as a library; nothing yet calls `add_reference()` to actually label a photo — a CLI or route for that is still needed.
