@@ -1,23 +1,25 @@
-NAS_MOUNT_PATH := /mnt/nas
-
-.PHONY: help check-nas setup build up down restart logs status pull clean
+.PHONY: help check-nas-reachable setup build up down restart logs status pull clean
 
 help:
-	@echo "make up        — verify NAS, start containers"
+	@echo "make up        — start containers (NAS mounted automatically via Docker NFS volume)"
 	@echo "make down      — stop containers"
 	@echo "make restart   — down + up"
 	@echo "make logs      — tail all container logs"
-	@echo "make status    — container status + NAS mount status"
+	@echo "make status    — container status"
 	@echo "make pull      — git pull + rebuild + restart"
 	@echo "make clean     — remove containers, images, volumes"
 	@echo ""
 	@echo "Note: Dropbox is mounted inside the immich-server container itself"
-	@echo "(via rclone), not on the host — nothing to mount here for that."
+	@echo "(via rclone), and the NAS thumbnail path is a Docker-native NFS"
+	@echo "volume — neither needs any host-level mount."
 
-check-nas:
-	@mountpoint -q $(NAS_MOUNT_PATH) || (echo "NAS not mounted at $(NAS_MOUNT_PATH) — mount it first" && exit 1)
+check-nas-reachable:
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	if [ -z "$$NAS_IP" ]; then echo "NAS_IP not set in .env"; exit 1; fi; \
+	ping -c1 -W2 $$NAS_IP > /dev/null 2>&1 || \
+		(echo "NAS at $$NAS_IP not reachable — check network before continuing" && exit 1)
 
-setup: check-nas
+setup: check-nas-reachable
 	@test -f .env || (echo "Missing .env — copy from .env.example" && exit 1)
 	@test -f immich-server/rclone.conf || \
 		(echo "Missing immich-server/rclone.conf — copy from rclone.conf.example and fill in your Dropbox token" && exit 1)
@@ -39,8 +41,6 @@ logs:
 
 status:
 	docker compose ps
-	@echo ""
-	@mountpoint -q $(NAS_MOUNT_PATH) && echo "NAS: mounted" || echo "NAS: NOT mounted"
 
 pull:
 	git pull
