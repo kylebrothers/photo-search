@@ -1,0 +1,6 @@
+.env
+immich-server/rclone.conf
+*.pyc
+__pycache__/
+*.json
+!landmark_references.example.json
