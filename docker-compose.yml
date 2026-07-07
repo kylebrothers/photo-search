@@ -4,6 +4,12 @@ services:
     env_file: .env
     environment:
       - IMMICH_MACHINE_LEARNING_URL=${IMMICH_MACHINE_LEARNING_URL}
+      # Immich defaults to expecting its DB host at "database" (matching
+      # Immich's own official example compose file's service name). Our
+      # Postgres service is named "postgres" instead, so this must be set
+      # explicitly or Immich fails with getaddrinfo ENOTFOUND database.
+      # Verified against a live deploy 2026-07-07.
+      - DB_HOSTNAME=postgres
     cap_add:
       - SYS_ADMIN
     devices:
@@ -18,9 +24,11 @@ services:
       - postgres
     restart: unless-stopped
 
+
   redis:
     image: docker.io/redis:6.2-alpine
     restart: unless-stopped
+
 
   postgres:
     # Verify this tag against Immich's current example compose file for
@@ -35,6 +43,7 @@ services:
       - ${DB_DATA_LOCATION}:/var/lib/postgresql/data   # local SSD bind mount — never NFS, never a Docker NFS volume
     restart: unless-stopped
 
+
   search-api:
     build: ./search-api
     env_file: .env
@@ -46,6 +55,7 @@ services:
     depends_on:
       - immich-server
     restart: unless-stopped
+
 
 volumes:
   # NFS-backed Docker volume — Docker mounts this directly, no host-level
