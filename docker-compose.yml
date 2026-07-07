@@ -9,7 +9,7 @@ services:
     devices:
       - /dev/fuse
     volumes:
-      - ${UPLOAD_LOCATION}:/usr/src/app/upload                          # NAS — thumbnails/previews
+      - immich_upload:/usr/src/app/upload                              # NAS, via Docker-native NFS volume — thumbnails/previews
       - ./immich-server/rclone.conf:/root/.config/rclone/rclone.conf:ro # local only, not committed
     ports:
       - "2283:2283"
@@ -32,7 +32,7 @@ services:
       - POSTGRES_USER=${DB_USERNAME}
       - POSTGRES_DB=${DB_DATABASE_NAME}
     volumes:
-      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data   # local SSD — never NFS
+      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data   # local SSD bind mount — never NFS, never a Docker NFS volume
     restart: unless-stopped
 
   search-api:
@@ -46,3 +46,15 @@ services:
     depends_on:
       - immich-server
     restart: unless-stopped
+
+volumes:
+  # NFS-backed Docker volume — Docker mounts this directly, no host-level
+  # /etc/fstab entry needed. Only Immich's own container can see this data;
+  # if a future host-side script needs it too, it'll need to run inside a
+  # container (e.g. `docker compose run`) mounting the same volume.
+  immich_upload:
+    driver: local
+    driver_opts:
+      type: nfs
+      device: ":${NAS_THUMBS_PATH}"
+      o: "nfsvers=4,addr=${NAS_IP},nolock,soft,rw"
