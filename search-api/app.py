@@ -56,12 +56,18 @@ def search():
 
     parsed = query_parser.parse_query(text)
 
-    # Collect asset ID sets from each relevant search mode, then intersect.
-    result_sets = []
+    # Preserve relevance ranking from whichever search mode establishes it
+    # (smart_search, if present — CLIP results are meaningfully ranked;
+    # metadata search's own order otherwise). Sets are used only as
+    # membership filters layered on top, never as the result list itself —
+    # a plain set has no defined order, which previously caused every query
+    # to return results in the same order regardless of relevance.
+    ordered_ids = []
+    filter_sets = []
 
     if parsed.object_query:
         smart_results = immich.smart_search(parsed.object_query)
-        result_sets.append({a["id"] for a in smart_results.get("assets", {}).get("items", [])})
+        ordered_ids = [a["id"] for a in smart_results.get("assets", {}).get("items", [])]
 
     if parsed.person_names or parsed.location or parsed.date_from:
         person_ids = [pid for pid in (immich.find_person_id(n) for n in parsed.person_names) if pid]
@@ -69,18 +75,20 @@ def search():
             city=parsed.location, date_from=parsed.date_from, date_to=parsed.date_to,
             person_ids=person_ids or None,
         )
-        result_sets.append({a["id"] for a in meta_results.get("assets", {}).get("items", [])})
+        meta_ids = [a["id"] for a in meta_results.get("assets", {}).get("items", [])]
+        if ordered_ids:
+            filter_sets.append(set(meta_ids))
+        else:
+            ordered_ids = meta_ids  # no object query — use metadata search's own order instead
 
-    # Landmark filtering happens post-hoc against whatever the above returned,
-    # since Immich has no landmark concept of its own.
-    asset_ids = set.intersection(*result_sets) if result_sets else set()
+    asset_ids_ordered = [aid for aid in ordered_ids if all(aid in s for s in filter_sets)]
 
     if parsed.landmark_names:
         from landmark.match import match_landmarks
-        asset_ids = {
-            aid for aid in asset_ids
+        asset_ids_ordered = [
+            aid for aid in asset_ids_ordered
             if any(name in [m[0] for m in match_landmarks(aid)] for name in parsed.landmark_names)
-        }
+        ]
 
     results = [
         {
@@ -89,7 +97,7 @@ def search():
             "thumbnail_url": f"/proxy/thumbnail/{aid}",
             "download_url": f"/proxy/download/{aid}",
         }
-        for aid in asset_ids
+        for aid in asset_ids_ordered
     ]
     return jsonify({"query": text, "parsed": parsed.__dict__, "results": results})
 
