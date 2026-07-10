@@ -4,10 +4,14 @@ people, metadata) into one natural-language query, since Immich's own
 search bar only handles one mode at a time. Also proxies thumbnails/downloads
 so the browser never needs an Immich API key directly.
 """
+import logging
+
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 import config
 import query_parser
 from immich_client import ImmichClient
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 immich = ImmichClient()
@@ -17,16 +21,29 @@ _initialized = False
 
 def init_known_entities():
     """
-    One-time setup: load known people and landmark names into query_parser.
-    Deferred to first request (see _ensure_initialized) rather than run at
-    import time, since immich-server may not be reachable yet when this
-    container starts — Flask's before_first_request hook, which used to
-    handle exactly this case, was removed in Flask 2.3+.
+    One-time setup: load known people, landmark names, and known city
+    values into query_parser. Deferred to first request (see
+    _ensure_initialized) rather than run at import time, since
+    immich-server may not be reachable yet when this container starts —
+    Flask's before_first_request hook, which used to handle exactly this
+    case, was removed in Flask 2.3+.
     """
     global _initialized
     people = [p["name"] for p in immich.get_people().get("people", []) if p.get("name")]
+
     from landmark.reference_embeddings import list_landmarks
-    query_parser.load_known_entities(people, list_landmarks())
+    landmarks = list_landmarks()
+
+    cities = []
+    try:
+        cities = immich.get_cities()
+        if not isinstance(cities, list):
+            logger.warning(f"get_cities() returned unexpected shape ({type(cities)}), ignoring for grounding")
+            cities = []
+    except Exception as e:
+        logger.warning(f"Could not fetch known cities for LLM grounding: {e}")
+
+    query_parser.load_known_entities(people, landmarks, cities)
     _initialized = True
 
 
@@ -59,9 +76,7 @@ def search():
     # Preserve relevance ranking from whichever search mode establishes it
     # (smart_search, if present — CLIP results are meaningfully ranked;
     # metadata search's own order otherwise). Sets are used only as
-    # membership filters layered on top, never as the result list itself —
-    # a plain set has no defined order, which previously caused every query
-    # to return results in the same order regardless of relevance.
+    # membership filters layered on top, never as the result list itself.
     ordered_ids = []
     filter_sets = []
 
