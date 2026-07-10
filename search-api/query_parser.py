@@ -26,6 +26,17 @@ class ParsedQuery:
 _KNOWN_PEOPLE = set()
 _KNOWN_LANDMARKS = set()
 
+# Connector/filler words that can be left over after stripping recognized
+# names/landmarks (e.g. "Kevin and Kyle" -> "and", "Kevin alone" -> "alone").
+# Without this filter, leftover noise words were being sent to CLIP's
+# smart_search as if they were real object/scene queries, which degraded or
+# zeroed out results that the person/metadata filter alone would have
+# answered correctly. Verified against a live bug 2026-07-09.
+_STOPWORDS = {
+    "and", "alone", "with", "together", "the", "a", "an", "of",
+    "at", "in", "on", "by",
+}
+
 
 def load_known_entities(people_names, landmark_names):
     global _KNOWN_PEOPLE, _KNOWN_LANDMARKS
@@ -70,5 +81,10 @@ def parse_query(text: str) -> ParsedQuery:
             result.date_to = datetime.now().isoformat()
         remaining = remaining.replace(date_match.group(0), "")
 
-    result.object_query = " ".join(remaining.split())  # collapse whitespace
+    # Drop connector/filler words before deciding there's a real object
+    # query left. If nothing meaningful remains, object_query stays empty
+    # and app.py correctly falls back to pure metadata/person filtering
+    # instead of sending noise to CLIP.
+    leftover_words = [w for w in remaining.split() if w.lower() not in _STOPWORDS]
+    result.object_query = " ".join(leftover_words)
     return result
