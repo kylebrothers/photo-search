@@ -51,6 +51,18 @@ class ImmichClient:
                 return p["id"]
         return None
 
+    def get_cities(self):
+        """
+        Returns the distinct city values actually present in the library —
+        used to ground the LLM query parser so it maps colloquial place
+        names (e.g. "New York") to the actual stored EXIF values (e.g.
+        "Manhattan") instead of guessing from its own training knowledge.
+        UNVERIFIED: response shape assumed to be a plain list of strings —
+        confirm against a live call before relying on it; adjust the
+        caller in app.py if the actual shape differs.
+        """
+        return self._get("/api/search/cities")
+
     def get_asset(self, asset_id):
         return self._get(f"/api/assets/{asset_id}")
 
