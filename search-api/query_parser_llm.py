@@ -86,7 +86,14 @@ def parse_query(text: str) -> ParsedQuery:
             # kept warm between infrequent search requests.
             "keep_alive": "5m",
         },
-        timeout=30,
+        # Bumped from 30s to 60s (2026-07-11) — the 1060 is slower than
+        # initially assumed, and 30s was racing against (and sometimes
+        # losing to) Gunicorn's own worker timeout, which killed the whole
+        # request ungracefully instead of letting this timeout fail
+        # cleanly into the rule-based fallback. See search-api/Dockerfile
+        # for the corresponding Gunicorn timeout bump — that one must stay
+        # LARGER than this value so this timeout wins the race.
+        timeout=60,
     )
     response.raise_for_status()
     raw = response.json().get("response", "")
