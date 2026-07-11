@@ -31,30 +31,44 @@ def load_known_entities(people_names, landmark_names, cities):
     _CITIES = list(cities)
 
 
+# Full JSON Schema, not just the bare string "json" — Ollama constrains
+# token generation to actually conform to this schema (field names, types),
+# not just "is syntactically valid JSON somehow". Switched 2026-07-11 after
+# the bare "json" format let the model produce schema-shaped-but-meaningless
+# output (e.g. object_query="house" for a query with no relation to houses).
+_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "person_names": {"type": "array", "items": {"type": "string"}},
+        "landmark_names": {"type": "array", "items": {"type": "string"}},
+        "location": {"type": ["string", "null"]},
+        "date_from": {"type": ["string", "null"]},
+        "date_to": {"type": ["string", "null"]},
+        "object_query": {"type": "string"},
+    },
+    "required": ["person_names", "landmark_names", "location", "date_from", "date_to", "object_query"],
+}
+
 _SYSTEM_PROMPT_TEMPLATE = """You extract structured search filters from a natural-language photo search query.
 
 Known people (use EXACTLY these strings if matched, never invent a name): {people}
 Known landmarks (use EXACTLY these strings if matched, never invent one): {landmarks}
 Known cities actually present in this photo library (map any place name in the query to the closest one of these; if none plausibly matches, leave location null rather than guessing): {cities}
 
-Respond with ONLY a JSON object, no other text, matching this exact schema:
-{{
-  "person_names": [string, ...],
-  "landmark_names": [string, ...],
-  "location": string or null,
-  "date_from": string or null,
-  "date_to": string or null,
-  "object_query": string
-}}
+Example — given known people ["Alex Rivera"], known cities ["Chicago"], and the
+query "Alex in Chicago at a park", the correct output is:
+{{"person_names": ["Alex Rivera"], "landmark_names": [], "location": "Chicago", "date_from": null, "date_to": null, "object_query": "park"}}
+
+Now do the same for the real query below, using ONLY the real known values listed above (not the example's).
 
 date_from and date_to, if present, must be ISO 8601 with milliseconds and a
-"Z" timezone suffix, e.g. "2026-06-01T00:00:00.000Z" — this exact format,
-nothing else, or Immich's API will reject the request.
+"Z" timezone suffix, e.g. "2026-06-01T00:00:00.000Z".
 
 Rules:
 - Only include a person or landmark if it is one of the known values above, matched by meaning (nicknames, partial names, misspellings all count).
-- "location" must be one of the known cities above, or null — never a place name that isn't in that list.
-- object_query should describe visual content only (objects, scenes, settings) — never include people's names, place names, or dates in it.
+- "location" must be one of the known cities above, or null.
+- object_query must only contain words describing visual content actually implied by the query — never invent unrelated words, never include names/places/dates.
+- If empty, object_query should be an empty string, not a guess.
 - If the query mentions a relative date ("last summer", "this year"), convert it to a real date range based on today's date: {today}.
 """
 
@@ -78,21 +92,17 @@ def parse_query(text: str) -> ParsedQuery:
             "model": config.OLLAMA_MODEL,
             "system": system_prompt,
             "prompt": text,
-            "format": "json",
+            "format": _RESPONSE_SCHEMA,   # real schema, not just the bare string "json"
             "stream": False,
-            # Unload the model shortly after use rather than keeping it
-            # resident in VRAM indefinitely — the GPU device is shared with
-            # immich-machine-learning, and this task doesn't need the model
-            # kept warm between infrequent search requests.
             "keep_alive": "5m",
+            # Deterministic extraction, not creative generation — a default
+            # temperature (~0.7-0.8) was a likely contributor to the model
+            # producing unrelated words in object_query.
+            "options": {"temperature": 0},
         },
-        # Bumped from 30s to 60s (2026-07-11) — the 1060 is slower than
-        # initially assumed, and 30s was racing against (and sometimes
-        # losing to) Gunicorn's own worker timeout, which killed the whole
-        # request ungracefully instead of letting this timeout fail
-        # cleanly into the rule-based fallback. See search-api/Dockerfile
-        # for the corresponding Gunicorn timeout bump — that one must stay
-        # LARGER than this value so this timeout wins the race.
+        # Must stay smaller than search-api/Dockerfile's Gunicorn --timeout
+        # (90s), so this timeout wins the race and fails gracefully into
+        # the rule-based fallback instead of Gunicorn killing the worker.
         timeout=60,
     )
     response.raise_for_status()
