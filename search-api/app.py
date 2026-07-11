@@ -6,6 +6,13 @@ so the browser never needs an Immich API key directly.
 """
 import logging
 
+# Configure logging at import time — Flask/Gunicorn do NOT configure
+# Python's logging module by default, so without this, every logger.info()/
+# logger.warning() call in this app and its imports (query_parser_llm.py,
+# immich_client.py, etc.) was silently going nowhere. Discovered 2026-07-11
+# while trying to debug the LLM parser's actual raw output.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 import config
 import query_parser
@@ -43,6 +50,7 @@ def init_known_entities():
     except Exception as e:
         logger.warning(f"Could not fetch known cities for LLM grounding: {e}")
 
+    logger.info(f"Loaded grounding data: {len(people)} people, {len(landmarks)} landmarks, {len(cities)} cities")
     query_parser.load_known_entities(people, landmarks, cities)
     _initialized = True
 
