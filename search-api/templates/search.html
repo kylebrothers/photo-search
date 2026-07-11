@@ -39,20 +39,25 @@
       status.textContent = 'Searching...';
       results.innerHTML = '';
 
+      const startTime = performance.now();
       try {
         const res = await fetch('/api/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ query })
         });
+        const elapsedMs = Math.round(performance.now() - startTime);
+        console.log(`[search] ${elapsedMs}ms, HTTP ${res.status}`);
+
         const data = await res.json();
+        console.log('[search] response:', data);
 
         if (!res.ok) {
           status.textContent = 'Error: ' + (data.error || 'search failed');
           return;
         }
 
-        status.textContent = `${data.results.length} result(s)`;
+        status.textContent = `${data.results.length} result(s) — ${elapsedMs}ms`;
         for (const r of data.results) {
           const div = document.createElement('div');
           div.className = 'result';
@@ -68,6 +73,8 @@
           results.appendChild(div);
         }
       } catch (err) {
+        const elapsedMs = Math.round(performance.now() - startTime);
+        console.error(`[search] failed after ${elapsedMs}ms:`, err);
         status.textContent = 'Network error — is search-api reachable?';
       }
     });
