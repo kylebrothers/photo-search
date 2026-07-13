@@ -27,15 +27,17 @@
 
 -- Create the role if it doesn't already exist. LOGIN so search-api can
 -- connect as it; NOSUPERUSER NOCREATEDB NOCREATEROLE by default.
--- Password is passed via psql -v role_password (quoted).
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'immich_search_ro') THEN
-        EXECUTE format('CREATE ROLE immich_search_ro LOGIN PASSWORD %s',
-                       :'role_password');
-    END IF;
-END
-$$;
+--
+-- NOTE: the password is interpolated by psql via -v role_password. This MUST
+-- be done OUTSIDE any dollar-quoted DO $$ ... $$ block — psql does not
+-- substitute :'var' inside dollar-quotes (the block body is opaque to the
+-- client), so an earlier DO-block version failed with "syntax error at :".
+-- Instead we build the CREATE ROLE statement with \gexec, which interpolates
+-- the variable (outside $$) and runs the result only if the role is absent —
+-- idempotent and re-runnable.
+SELECT 'CREATE ROLE immich_search_ro LOGIN PASSWORD ' || quote_literal(:'role_password')
+WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'immich_search_ro')
+\gexec
 
 -- Start from zero: strip anything this role may have inherited, including the
 -- public schema's default privileges.
