@@ -1,27 +1,30 @@
 """
 search_agent.py — Tool-calling search agent (Claude API).
 
-Replaces the one-shot "parse into fixed JSON" approach (query_parser_llm.py)
-with a tool-calling loop. The agent resolves names/places/dates and composes
-retrieval by calling tools, then signals completion with finalize_search.
+Reference-based tool-calling loop. The agent resolves names/places/dates and
+composes retrieval by calling tools, then signals completion with
+finalize_search. Retrieval results are held server-side in a per-request
+ResultStore; the model passes handles, never bulk photo ids (see tools.py).
 
 Design decisions (see README "Agreed design going forward"):
-  - Model is pinned via env (AGENT_MODEL), NOT auto-"latest" — SQL/tool
-    correctness is prompt-sensitive, so model moves are deliberate, followed
-    by re-running the structured test list.
-  - AGENT_MODEL and SQL_MODEL are separate env vars. Today they default to
-    the same model; the split exists so the SQL tool's model can be escalated
-    independently (Haiku -> Sonnet) without moving the orchestrator. The
-    per-call swap is realised in sql_tool.py, which makes its own client call
-    with SQL_MODEL when run_readonly_sql needs a model; the orchestration loop
-    here always uses AGENT_MODEL.
+  - Model pinned via env (AGENT_MODEL), NOT auto-"latest" — SQL/tool
+    correctness is prompt-sensitive, so model moves are deliberate.
+  - AGENT_MODEL and SQL_MODEL are separate env vars; the SQL step's model can
+    be escalated (Haiku -> Sonnet) independently of the orchestrator. The SQL
+    call is made in sql_tool.py with SQL_MODEL; this loop uses AGENT_MODEL.
   - Loop bounds: hard turn cap AND a wall-clock timeout independent of
-    Gunicorn's --timeout (same race-condition lesson as the Ollama bug —
-    this must fire before Gunicorn kills the worker).
-  - On total failure (API error, timeout, no finalize), fall back to the
-    rule-based parser. query_parser_rules.py remains the permanent safety net.
-  - The full tool-call trace is captured and returned in the API response,
-    replacing the deterministic-Python-trace debuggability the old design had.
+    Gunicorn's --timeout (must fire before Gunicorn kills the worker).
+  - On total failure (API error, timeout, truncation, no finalize), fall back
+    to the rule-based parser. query_parser_rules.py is the permanent net.
+  - Full tool-call trace captured and returned in the API response.
+
+Quick fixes folded in after the max_tokens-truncation incident:
+  - max_tokens is configurable (AGENT_MAX_TOKENS) and defaults high enough
+    that a finalize turn can't truncate. With handles, turns are tiny anyway.
+  - The system prompt forbids prose between tool calls (all explanation goes
+    in finalize_search), so the model doesn't burn a turn narrating.
+  - stop_reason == "max_tokens" is logged distinctly as truncation (a config
+    problem) rather than being silently lumped in with "model gave up".
 """
 
 import json
@@ -38,31 +41,38 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are a photo-search agent for a personal photo library. \
 Given a natural-language query, find the matching photos by calling the \
-provided tools, then call finalize_search exactly once with the final asset \
-ids and a short explanation.
+provided tools, then call finalize_search exactly once with the final result \
+handle and a short explanation.
+
+Result handles:
+- search_photos, run_readonly_sql (photo queries), and combine_results each \
+return a HANDLE to a stored result set plus a count — never the photo ids \
+themselves. You reason about handles ("result_1, 46 photos"); you never see or \
+need the ids. Pass a handle to finalize_search to return those photos.
 
 How to work:
-- To filter by a person, you must resolve their name to a person UUID first. \
-Names in the library may differ from what the user typed (nicknames, partial \
-names, misspellings). Use run_readonly_sql to look up the person table by a \
-fuzzy name match, then pass the id to search_photos.
+- To filter by a person, resolve their name to a person UUID first: call \
+run_readonly_sql for a fuzzy name lookup (it returns the id inline), then pass \
+the id to search_photos.
 - To filter by place, resolve the user's place name to a real stored city \
 value the same way — the library stores specific EXIF-derived places (e.g. \
-"Manhattan"), which may differ from a colloquial name (e.g. "New York"). \
-Use run_readonly_sql against the exif/geo tables to find the closest real \
-value, then pass it to search_photos.
+"Manhattan"), which may differ from a colloquial name (e.g. "New York").
 - For an object or scene description ("beach", "a dog"), pass it as \
-object_query to search_photos — that runs semantic image search.
-- For predicates search_photos cannot express — "only person X in the photo \
-and nobody else", text visible in the image, or place matching more flexible \
-than one exact city — write a single read-only SELECT with run_readonly_sql \
-and pass the resulting asset ids straight to finalize_search.
-- Prefer the fewest tool calls that answer the query correctly. If the query \
-is a simple object search with no person/place/date, a single search_photos \
-call is enough.
+object_query to search_photos.
+- For predicates search_photos can't express — "only person X in the photo and \
+nobody else", text visible in the image, geo proximity — use run_readonly_sql \
+to SELECT the photo set (it returns a handle).
+- To combine an object search with a SQL-only predicate (e.g. "beach photos \
+where only Kevin is in frame"): get a handle from search_photos and a handle \
+from run_readonly_sql, then call combine_results with mode 'intersect'. Do NOT \
+try to merge photo ids yourself — you don't have them; use combine_results.
+- Prefer the fewest tool calls that answer the query correctly. A simple \
+object search with no person/place/date is one search_photos call, then \
+finalize_search.
 
-Be honest in the explanation: if you could not resolve a filter, or results \
-are partial, say so plainly."""
+Do NOT write explanatory prose between tool calls. Put all of your explanation \
+into finalize_search's explanation field, and be honest there if a filter \
+couldn't be resolved or results are partial."""
 
 
 def _to_text_block(content):
@@ -75,34 +85,29 @@ def run_search_agent(query_text, immich, claude_client):
     Run the agent loop for a single query.
 
     Returns a dict:
-        {
-          "asset_ids":   [str, ...],   # final ordered ids
-          "explanation": str,          # user-facing account
-          "trace":       [ ... ],      # tool-call trace for debugging
-          "fell_back":   bool,         # True if rules fallback was used
-        }
+        {"asset_ids": [...], "explanation": str, "trace": [...], "fell_back": bool}
 
-    Never raises for expected failure modes — on API error, timeout, or a
-    loop that never finalises, it falls back to the rule-based parser and
-    marks fell_back=True.
+    Never raises for expected failure modes — on API error, timeout,
+    truncation, or a loop that never finalises, it falls back to the rule-based
+    parser and marks fell_back=True.
     """
     trace = []
     started = time.monotonic()
     deadline = started + config.AGENT_WALL_CLOCK_TIMEOUT
 
-    tool_schemas = tools_mod.build_tool_schemas(
-        include_sql=config.AGENT_SQL_ENABLED
-    )
+    store = tools_mod.ResultStore()
+    tool_schemas = tools_mod.build_tool_schemas(include_sql=config.AGENT_SQL_ENABLED)
 
-    # Map tool name -> executor. finalize_search and run_readonly_sql are
-    # handled specially in the loop, so they're not in this dispatch table.
+    # Map tool name -> executor. finalize_search is handled specially in the
+    # loop (it resolves a handle and terminates), so it's not here.
     executors = {
-        "search_photos": lambda **kw: tools_mod.execute_search_photos(immich, **kw),
+        "search_photos": lambda **kw: tools_mod.execute_search_photos(immich, store, **kw),
+        "combine_results": lambda **kw: tools_mod.execute_combine_results(store, **kw),
     }
     if config.AGENT_SQL_ENABLED:
         import sql_tool
         executors["run_readonly_sql"] = lambda **kw: sql_tool.execute_run_readonly_sql(
-            claude_client=claude_client, **kw
+            store, claude_client=claude_client, **kw
         )
 
     messages = [{"role": "user", "content": query_text}]
@@ -116,7 +121,7 @@ def run_search_agent(query_text, immich, claude_client):
             remaining = max(1.0, deadline - time.monotonic())
             response = claude_client.messages.create(
                 model=config.AGENT_MODEL,
-                max_tokens=1024,
+                max_tokens=config.AGENT_MAX_TOKENS,
                 system=_SYSTEM_PROMPT,
                 tools=tool_schemas,
                 messages=messages,
@@ -124,12 +129,21 @@ def run_search_agent(query_text, immich, claude_client):
             )
 
             if response.stop_reason != "tool_use":
-                # Model responded without calling a tool (e.g. asked a
-                # question or gave up). Treat as non-finalised -> fall back.
                 text = _to_text_block(response.content)
+                if response.stop_reason == "max_tokens":
+                    # A config problem, not the model giving up. With handles a
+                    # finalize turn is tiny, so this should essentially never
+                    # fire; log loudly if it does.
+                    logger.error(
+                        f"Agent turn TRUNCATED at max_tokens "
+                        f"({config.AGENT_MAX_TOKENS}) — raise AGENT_MAX_TOKENS. "
+                        f"Partial text: {text!r}"
+                    )
+                    return _fallback(query_text, immich, trace,
+                                     reason="max_tokens_truncation")
                 logger.warning(
-                    f"Agent stopped without tool_use (stop_reason="
-                    f"{response.stop_reason}): {text!r}"
+                    f"Agent stopped without tool_use "
+                    f"(stop_reason={response.stop_reason}): {text!r}"
                 )
                 return _fallback(query_text, immich, trace, reason="no_tool_use")
 
@@ -137,40 +151,51 @@ def run_search_agent(query_text, immich, claude_client):
             # follow-up to be valid).
             messages.append({"role": "assistant", "content": response.content})
 
+            final_result = None
             tool_results = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
 
                 if block.name == "finalize_search":
-                    asset_ids = block.input.get("asset_ids", []) or []
+                    handle = block.input.get("handle")
                     explanation = block.input.get("explanation", "") or ""
+                    asset_ids = store.get(handle)
+                    if asset_ids is None:
+                        # Bad handle — return an error result and let the model
+                        # retry rather than terminating with nothing.
+                        result_json = json.dumps({
+                            "error": f"unknown handle {handle!r}; call a search "
+                                     f"tool first and use the handle it returns."
+                        })
+                        trace.append({
+                            "turn": turn, "tool": "finalize_search",
+                            "input": block.input, "error": True,
+                            "result_preview": result_json[:500],
+                        })
+                        tool_results.append({
+                            "type": "tool_result", "tool_use_id": block.id,
+                            "content": result_json, "is_error": True,
+                        })
+                        continue
                     trace.append({
                         "turn": turn, "tool": "finalize_search",
-                        "input": {"asset_ids_count": len(asset_ids),
+                        "input": {"handle": handle, "count": len(asset_ids),
                                   "explanation": explanation},
                     })
-                    elapsed = round(time.monotonic() - started, 2)
-                    logger.info(
-                        f"Agent finalised in {turn + 1} turn(s), {elapsed}s, "
-                        f"{len(asset_ids)} ids"
-                    )
-                    return {
-                        "asset_ids": asset_ids,
-                        "explanation": explanation,
-                        "trace": trace,
-                        "fell_back": False,
+                    final_result = {
+                        "asset_ids": asset_ids, "explanation": explanation,
+                        "trace": trace, "fell_back": False,
                     }
+                    break  # terminal — stop processing this turn's blocks
 
                 # Ordinary tool call — execute and collect the result.
                 try:
                     result = executors[block.name](**block.input)
                     result_json = json.dumps(result)
-                    is_error = False
+                    is_error = bool(isinstance(result, dict) and result.get("error"))
                 except KeyError:
-                    result_json = json.dumps(
-                        {"error": f"unknown tool {block.name}"}
-                    )
+                    result_json = json.dumps({"error": f"unknown tool {block.name}"})
                     is_error = True
                 except Exception as e:
                     logger.warning(f"Tool {block.name} raised: {e}")
@@ -178,17 +203,21 @@ def run_search_agent(query_text, immich, claude_client):
                     is_error = True
 
                 trace.append({
-                    "turn": turn, "tool": block.name,
-                    "input": block.input,
-                    "error": is_error,
-                    "result_preview": result_json[:500],
+                    "turn": turn, "tool": block.name, "input": block.input,
+                    "error": is_error, "result_preview": result_json[:500],
                 })
                 tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_json,
-                    "is_error": is_error,
+                    "type": "tool_result", "tool_use_id": block.id,
+                    "content": result_json, "is_error": is_error,
                 })
+
+            if final_result is not None:
+                elapsed = round(time.monotonic() - started, 2)
+                logger.info(
+                    f"Agent finalised in {turn + 1} turn(s), {elapsed}s, "
+                    f"{len(final_result['asset_ids'])} ids"
+                )
+                return final_result
 
             messages.append({"role": "user", "content": tool_results})
 
@@ -212,12 +241,11 @@ def _fallback(query_text, immich, trace, reason):
     import query_parser_rules as rules
 
     parsed = rules.parse_query(query_text)
-
     person_ids = [
         pid for pid in (immich.find_person_id(n) for n in parsed.person_names)
         if pid
     ]
-    asset_ids = tools_mod.execute_search_photos(
+    asset_ids = tools_mod.run_ranked_search(
         immich,
         object_query=parsed.object_query,
         person_ids=person_ids,

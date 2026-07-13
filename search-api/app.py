@@ -75,7 +75,7 @@ def search():
         parsed = rules.parse_query(text)
         person_ids = [pid for pid in (immich.find_person_id(n)
                                       for n in parsed.person_names) if pid]
-        asset_ids = tools_mod.execute_search_photos(
+        asset_ids = tools_mod.run_ranked_search(
             immich, object_query=parsed.object_query, person_ids=person_ids,
             city=parsed.location, date_from=parsed.date_from, date_to=parsed.date_to,
         )

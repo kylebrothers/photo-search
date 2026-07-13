@@ -48,6 +48,12 @@ SQL_MODEL = os.environ.get("SQL_MODEL", "claude-haiku-4-5-20251001")
 AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "6"))
 AGENT_WALL_CLOCK_TIMEOUT = float(os.environ.get("AGENT_WALL_CLOCK_TIMEOUT", "60"))
 
+# Max output tokens per agent turn. With reference-based handles a finalize
+# turn is tiny (a handle + a sentence), so the old 1024 truncation can't recur;
+# kept generous as a backstop. Raise if a legitimately long SQL request or
+# explanation ever truncates (logged distinctly as max_tokens truncation).
+AGENT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
+
 # Toggle the run_readonly_sql tool. Lets the four-tool loop be proven before
 # the SQL tool's Postgres role exists (README step 4 before 5). When false,
 # the agent runs with search_photos + finalize_search only.
