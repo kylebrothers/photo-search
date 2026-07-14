@@ -25,15 +25,12 @@ Quick fixes folded in after the max_tokens-truncation incident:
     in finalize_search), so the model doesn't burn a turn narrating.
   - stop_reason == "max_tokens" is logged distinctly as truncation (a config
     problem) rather than being silently lumped in with "model gave up".
-  - The system prompt forbids asking the user for clarification: the agent
-    gets one query and has no channel to deliver a question back, so any
-    clarifying question would stall into a fallback (observed on a bare-name
-    query). It must always act on the query as given.
 """
 
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 import anthropic
 
@@ -43,10 +40,14 @@ import tools as tools_mod
 logger = logging.getLogger(__name__)
 
 
-_SYSTEM_PROMPT = """You are a photo-search agent for a personal photo library. \
+_SYSTEM_PROMPT_TEMPLATE = """You are a photo-search agent for a personal photo library. \
 Given a natural-language query, find the matching photos by calling the \
 provided tools, then call finalize_search exactly once with the final result \
 handle and a short explanation.
+
+Today's date is {today}. Use it to resolve any relative or bare date in the \
+query (e.g. "last month", "this summer", or a bare month) to a concrete \
+range; do not guess the year.
 
 Result handles:
 - search_photos, run_readonly_sql (photo queries), and combine_results each \
@@ -66,10 +67,18 @@ the assumption in finalize_search's explanation.
 How to work:
 - To filter by a person, resolve their name to a person UUID first: call \
 run_readonly_sql for a fuzzy name lookup (it returns the id inline), then pass \
-the id to search_photos.
+the id to search_photos. If that lookup returns NO rows, do NOT give up — the \
+query name may be a nickname, initials, or maiden name that ILIKE can't match \
+(e.g. "Rebecca" vs stored "Becky"). Retry ONCE by selecting ALL people \
+(SELECT id, name FROM person) and reason over that short list yourself to pick \
+the intended person. Only conclude no such person exists after that.
 - To filter by place, resolve the user's place name to a real stored city \
 value the same way — the library stores specific EXIF-derived places (e.g. \
-"Manhattan"), which may differ from a colloquial name (e.g. "New York").
+"Manhattan"), which may differ from a colloquial name (e.g. "New York"). If a \
+place lookup returns no rows, retry ONCE by selecting the DISTINCT cities \
+actually present in the library (SELECT DISTINCT city FROM asset_exif WHERE \
+city IS NOT NULL) — a short list — and pick the closest match yourself before \
+concluding the place isn't represented.
 - For an object or scene description ("beach", "a dog"), pass it as \
 object_query to search_photos.
 - For predicates search_photos can't express — "only person X in the photo and \
@@ -82,6 +91,10 @@ try to merge photo ids yourself — you don't have them; use combine_results.
 - Prefer the fewest tool calls that answer the query correctly. A simple \
 object search with no person/place/date is one search_photos call, then \
 finalize_search.
+
+A zero-result search means only that nothing matched THIS query — never state \
+or imply that the library is empty or unindexed. Just report that no photos \
+matched the query.
 
 Do NOT write explanatory prose between tool calls. Put all of your explanation \
 into finalize_search's explanation field, and be honest there if a filter \
@@ -111,6 +124,13 @@ def run_search_agent(query_text, immich, claude_client):
     store = tools_mod.ResultStore()
     tool_schemas = tools_mod.build_tool_schemas(include_sql=config.AGENT_SQL_ENABLED)
 
+    # Inject today's date so the model resolves relative/bare dates correctly
+    # rather than guessing the year (a bare-month query previously landed on the
+    # wrong year and returned nothing).
+    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+        today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
+
     # Map tool name -> executor. finalize_search is handled specially in the
     # loop (it resolves a handle and terminates), so it's not here.
     executors = {
@@ -135,7 +155,7 @@ def run_search_agent(query_text, immich, claude_client):
             response = claude_client.messages.create(
                 model=config.AGENT_MODEL,
                 max_tokens=config.AGENT_MAX_TOKENS,
-                system=_SYSTEM_PROMPT,
+                system=system_prompt,
                 tools=tool_schemas,
                 messages=messages,
                 timeout=remaining,
