@@ -25,6 +25,10 @@ Quick fixes folded in after the max_tokens-truncation incident:
     in finalize_search), so the model doesn't burn a turn narrating.
   - stop_reason == "max_tokens" is logged distinctly as truncation (a config
     problem) rather than being silently lumped in with "model gave up".
+  - The system prompt forbids asking the user for clarification: the agent
+    gets one query and has no channel to deliver a question back, so any
+    clarifying question would stall into a fallback (observed on a bare-name
+    query). It must always act on the query as given.
 """
 
 import json
@@ -49,6 +53,15 @@ Result handles:
 return a HANDLE to a stored result set plus a count — never the photo ids \
 themselves. You reason about handles ("result_1, 46 photos"); you never see or \
 need the ids. Pass a handle to finalize_search to return those photos.
+
+You get exactly ONE query and cannot ask the user anything back — there is no \
+conversation, and any question you write is discarded and the search fails. So \
+NEVER ask for clarification. Always act on the query as given, making the most \
+reasonable interpretation and proceeding. In particular, a bare name (e.g. \
+"Kevin") means "photos containing that person" — resolve the name to a person \
+id and search; do not stop to ask what kind of photos are wanted. If a query \
+is genuinely ambiguous, pick the most likely reading, run the search, and note \
+the assumption in finalize_search's explanation.
 
 How to work:
 - To filter by a person, resolve their name to a person UUID first: call \
