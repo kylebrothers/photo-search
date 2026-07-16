@@ -2,124 +2,271 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Photo Search</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Find a Photo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
-  body { font-family: system-ui, sans-serif; margin: 2rem; background: #111; color: #eee; }
-  h1 { font-size: 1.25rem; }
-  #search-form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
-  #query { flex: 1; padding: 0.5rem; font-size: 1rem; }
-  button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
-  #status { color: #999; margin-bottom: 0.5rem; }
-  #explanation { color: #cdd; background: #1c1c1c; border-left: 3px solid #6cf;
-                 padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; display: none;
-                 font-size: 0.9rem; line-height: 1.4; }
-  #fallback-notice { color: #fc9; background: #2a2114; border-left: 3px solid #f7971e;
-                     padding: 0.4rem 0.75rem; margin-bottom: 0.75rem; display: none;
-                     font-size: 0.85rem; }
-  #trace-wrap { margin-bottom: 1.25rem; display: none; }
-  #trace-wrap summary { color: #888; cursor: pointer; font-size: 0.8rem; }
-  #trace { background: #161616; border: 1px solid #262626; border-radius: 4px;
-           padding: 0.6rem; margin-top: 0.4rem; font-family: ui-monospace, monospace;
-           font-size: 0.75rem; color: #9c9; white-space: pre-wrap; overflow-x: auto; }
-  #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem; }
-  .result { background: #1c1c1c; border-radius: 6px; overflow: hidden; }
-  .result img { width: 100%; display: block; aspect-ratio: 1; object-fit: cover; }
-  .result-links { display: flex; justify-content: space-between; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
-  .result-links a { color: #6cf; text-decoration: none; }
+  :root {
+    --paper: #F6F0E4;
+    --ink: #2C2620;
+    --ink-soft: #756B5C;
+    --card: #FFFDF8;
+    --card-border: #E8D9C5;
+    --moss: #6E7F5C;
+    --moss-dark: #56634A;
+    --gold: #D6A24A;
+    --gold-dark: #C08E3A;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 2.5rem 1.5rem 4rem;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Nunito', sans-serif;
+  }
+
+  .page { max-width: 980px; margin: 0 auto; }
+
+  .hero { text-align: center; }
+
+  .eyebrow {
+    margin: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--moss);
+  }
+
+  h1 {
+    font-family: 'Fraunces', serif;
+    font-weight: 600;
+    font-size: clamp(2.1rem, 5vw, 3.1rem);
+    margin: 0.4rem 0 0.6rem;
+    color: var(--ink);
+  }
+
+  .subhead {
+    margin: 0 auto;
+    max-width: 440px;
+    color: var(--ink-soft);
+    font-size: 1.05rem;
+    line-height: 1.5;
+  }
+
+  .search-bar {
+    display: flex;
+    gap: 0.4rem;
+    max-width: 560px;
+    margin: 1.9rem auto 0;
+    background: #fff;
+    padding: 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--card-border);
+    box-shadow: 0 4px 14px rgba(44, 38, 32, 0.08);
+  }
+
+  #query {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    padding: 0.65rem 1rem;
+    font-family: 'Nunito', sans-serif;
+    font-size: 1rem;
+    color: var(--ink);
+  }
+
+  #query::placeholder { color: #b3a999; }
+
+  .search-bar button {
+    border: none;
+    background: var(--gold);
+    color: #fff;
+    font-family: 'Nunito', sans-serif;
+    font-weight: 800;
+    font-size: 0.95rem;
+    padding: 0.65rem 1.5rem;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .search-bar button:hover { background: var(--gold-dark); }
+
+  #query:focus-visible,
+  .search-bar button:focus-visible,
+  .save-btn:focus-visible {
+    outline: 2px solid var(--moss);
+    outline-offset: 2px;
+  }
+
+  .status {
+    margin: 0.9rem 0 0;
+    min-height: 1.3em;
+    color: var(--ink-soft);
+    font-size: 0.92rem;
+  }
+
+  main { margin-top: 2.5rem; }
+
+  .empty-state {
+    text-align: center;
+    color: var(--ink-soft);
+    font-style: italic;
+    padding: 3rem 1rem;
+  }
+
+  .results {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 2rem 1.75rem;
+  }
+
+  .photo-card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 4px;
+    padding: 0.6rem 0.6rem 0.85rem;
+    box-shadow: 0 6px 16px rgba(44, 38, 32, 0.12);
+    transform: rotate(var(--tilt, -1deg));
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+  }
+
+  .photo-card:nth-child(3n+1) { --tilt: -1.3deg; }
+  .photo-card:nth-child(3n+2) { --tilt: 1deg; }
+  .photo-card:nth-child(3n+3) { --tilt: -0.5deg; }
+
+  .photo-card:hover,
+  .photo-card:focus-within {
+    transform: rotate(0deg) translateY(-4px);
+    box-shadow: 0 12px 24px rgba(44, 38, 32, 0.18);
+  }
+
+  .photo-card img {
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    display: block;
+    border-radius: 2px;
+    background: #ece3d3;
+  }
+
+  .save-btn {
+    margin-top: 0.65rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    width: 100%;
+    padding: 0.55rem 0.6rem;
+    background: var(--moss);
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    font-family: 'Nunito', sans-serif;
+    font-weight: 700;
+    font-size: 0.85rem;
+    text-decoration: none;
+    transition: background 0.15s ease;
+  }
+
+  .save-btn:hover { background: var(--moss-dark); }
+
+  .save-btn svg { flex-shrink: 0; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .photo-card, .search-bar button, .save-btn { transition: none; }
+  }
+
+  @media (max-width: 480px) {
+    body { padding: 2rem 1rem 3rem; }
+    .search-bar { flex-direction: column; border-radius: 20px; }
+    .search-bar button { width: 100%; }
+  }
 </style>
 </head>
 <body>
-  <h1>Photo Search</h1>
-  <form id="search-form">
-    <input id="query" type="text" placeholder="e.g. Sarah at the beach in Portugal last summer" autocomplete="off">
-    <button type="submit">Search</button>
-  </form>
-  <div id="status"></div>
-  <div id="explanation"></div>
-  <div id="fallback-notice"></div>
-  <details id="trace-wrap">
-    <summary>Tool-call trace</summary>
-    <div id="trace"></div>
-  </details>
-  <div id="results"></div>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Family Photos</p>
+      <h1>Find a photo</h1>
+      <p class="subhead">Type a name, a place, or what's happening in the picture.</p>
+      <form id="search-form" class="search-bar">
+        <input id="query" type="text" placeholder="Grandma at the lake, 2019…" autocomplete="off">
+        <button type="submit">Search</button>
+      </form>
+      <p id="status" class="status"></p>
+    </header>
+
+    <main>
+      <div id="empty-state" class="empty-state">
+        <p>Your search results will show up here.</p>
+      </div>
+      <div id="results" class="results"></div>
+    </main>
+  </div>
 
   <script>
     const form = document.getElementById('search-form');
-    const status = document.getElementById('status');
-    const explanationEl = document.getElementById('explanation');
-    const fallbackEl = document.getElementById('fallback-notice');
-    const traceWrap = document.getElementById('trace-wrap');
-    const traceEl = document.getElementById('trace');
+    const queryInput = document.getElementById('query');
+    const statusEl = document.getElementById('status');
+    const emptyState = document.getElementById('empty-state');
     const results = document.getElementById('results');
+
+    const downloadIcon = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 1.5V10.5M8 10.5L4.5 7M8 10.5L11.5 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M2.5 13.5H13.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    </svg>`;
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const query = document.getElementById('query').value.trim();
+      const query = queryInput.value.trim();
       if (!query) return;
 
-      status.textContent = 'Searching...';
+      emptyState.style.display = 'none';
       results.innerHTML = '';
-      explanationEl.style.display = 'none';
-      fallbackEl.style.display = 'none';
-      traceWrap.style.display = 'none';
+      statusEl.textContent = 'Looking…';
 
-      const startTime = performance.now();
       try {
         const res = await fetch('/api/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ query })
         });
-        const elapsedMs = Math.round(performance.now() - startTime);
-        console.log(`[search] ${elapsedMs}ms, HTTP ${res.status}`);
-
         const data = await res.json();
-        console.log('[search] response:', data);
 
         if (!res.ok) {
-          status.textContent = 'Error: ' + (data.error || 'search failed');
+          statusEl.textContent = 'Something went wrong. Please try again.';
           return;
         }
 
-        status.textContent = `${data.results.length} result(s) — ${elapsedMs}ms`;
-
-        // Agent's plain-language account of what it did.
-        if (data.explanation) {
-          explanationEl.textContent = data.explanation;
-          explanationEl.style.display = 'block';
+        if (!data.results.length) {
+          statusEl.textContent = "No photos matched. Try different or fewer words.";
+          return;
         }
 
-        // Fallback notice (rule-based parser was used).
-        if (data.fell_back) {
-          fallbackEl.textContent = 'Fell back to the rule-based parser for this query.';
-          fallbackEl.style.display = 'block';
-        }
-
-        // Tool-call trace (collapsed by default) — replaces the old
-        // deterministic-Python-trace debuggability.
-        if (data.trace && data.trace.length) {
-          traceEl.textContent = JSON.stringify(data.trace, null, 2);
-          traceWrap.style.display = 'block';
-        }
+        statusEl.textContent = `${data.results.length} photo${data.results.length === 1 ? '' : 's'} found`;
 
         for (const r of data.results) {
-          const div = document.createElement('div');
-          div.className = 'result';
-          div.innerHTML = `
-            <a href="${r.view_url}" target="_blank">
-              <img src="${r.thumbnail_url}" loading="lazy" alt="">
-            </a>
-            <div class="result-links">
-              <a href="${r.view_url}" target="_blank">View in Immich</a>
-              <a href="${r.download_url}">Download</a>
-            </div>
+          const card = document.createElement('div');
+          card.className = 'photo-card';
+          card.innerHTML = `
+            <img src="${r.thumbnail_url}" loading="lazy" alt="">
+            <a class="save-btn" href="${r.download_url}">${downloadIcon} Save photo</a>
           `;
-          results.appendChild(div);
+          results.appendChild(card);
         }
       } catch (err) {
-        const elapsedMs = Math.round(performance.now() - startTime);
-        console.error(`[search] failed after ${elapsedMs}ms:`, err);
-        status.textContent = 'Network error — is search-api reachable?';
+        console.error('[search] failed:', err);
+        statusEl.textContent = 'Something went wrong. Please try again.';
       }
     });
   </script>

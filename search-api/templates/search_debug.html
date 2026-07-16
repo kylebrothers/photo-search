@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Photo Search — Debug</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; background: #111; color: #eee; }
+  h1 { font-size: 1.25rem; }
+  #search-form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+  #query { flex: 1; padding: 0.5rem; font-size: 1rem; }
+  button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+  #status { color: #999; margin-bottom: 0.5rem; }
+  #explanation { color: #cdd; background: #1c1c1c; border-left: 3px solid #6cf;
+                 padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; display: none;
+                 font-size: 0.9rem; line-height: 1.4; }
+  #fallback-notice { color: #fc9; background: #2a2114; border-left: 3px solid #f7971e;
+                     padding: 0.4rem 0.75rem; margin-bottom: 0.75rem; display: none;
+                     font-size: 0.85rem; }
+  #trace-wrap { margin-bottom: 1.25rem; display: none; }
+  #trace-wrap summary { color: #888; cursor: pointer; font-size: 0.8rem; }
+  #trace { background: #161616; border: 1px solid #262626; border-radius: 4px;
+           padding: 0.6rem; margin-top: 0.4rem; font-family: ui-monospace, monospace;
+           font-size: 0.75rem; color: #9c9; white-space: pre-wrap; overflow-x: auto; }
+  #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem; }
+  .result { background: #1c1c1c; border-radius: 6px; overflow: hidden; }
+  .result img { width: 100%; display: block; aspect-ratio: 1; object-fit: cover; }
+  .result-links { display: flex; justify-content: space-between; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
+  .result-links a { color: #6cf; text-decoration: none; }
+</style>
+</head>
+<body>
+  <h1>Photo Search — Debug</h1>
+  <form id="search-form">
+    <input id="query" type="text" placeholder="e.g. Sarah at the beach in Portugal last summer" autocomplete="off">
+    <button type="submit">Search</button>
+  </form>
+  <div id="status"></div>
+  <div id="explanation"></div>
+  <div id="fallback-notice"></div>
+  <details id="trace-wrap">
+    <summary>Tool-call trace</summary>
+    <div id="trace"></div>
+  </details>
+  <div id="results"></div>
+
+  <script>
+    const form = document.getElementById('search-form');
+    const status = document.getElementById('status');
+    const explanationEl = document.getElementById('explanation');
+    const fallbackEl = document.getElementById('fallback-notice');
+    const traceWrap = document.getElementById('trace-wrap');
+    const traceEl = document.getElementById('trace');
+    const results = document.getElementById('results');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const query = document.getElementById('query').value.trim();
+      if (!query) return;
+
+      status.textContent = 'Searching...';
+      results.innerHTML = '';
+      explanationEl.style.display = 'none';
+      fallbackEl.style.display = 'none';
+      traceWrap.style.display = 'none';
+
+      const startTime = performance.now();
+      try {
+        const res = await fetch('/api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query })
+        });
+        const elapsedMs = Math.round(performance.now() - startTime);
+        console.log(`[search] ${elapsedMs}ms, HTTP ${res.status}`);
+
+        const data = await res.json();
+        console.log('[search] response:', data);
+
+        if (!res.ok) {
+          status.textContent = 'Error: ' + (data.error || 'search failed');
+          return;
+        }
+
+        status.textContent = `${data.results.length} result(s) — ${elapsedMs}ms`;
+
+        // Agent's plain-language account of what it did.
+        if (data.explanation) {
+          explanationEl.textContent = data.explanation;
+          explanationEl.style.display = 'block';
+        }
+
+        // Fallback notice (rule-based parser was used).
+        if (data.fell_back) {
+          fallbackEl.textContent = 'Fell back to the rule-based parser for this query.';
+          fallbackEl.style.display = 'block';
+        }
+
+        // Tool-call trace (collapsed by default) — replaces the old
+        // deterministic-Python-trace debuggability.
+        if (data.trace && data.trace.length) {
+          traceEl.textContent = JSON.stringify(data.trace, null, 2);
+          traceWrap.style.display = 'block';
+        }
+
+        for (const r of data.results) {
+          const div = document.createElement('div');
+          div.className = 'result';
+          div.innerHTML = `
+            <a href="${r.view_url}" target="_blank">
+              <img src="${r.thumbnail_url}" loading="lazy" alt="">
+            </a>
+            <div class="result-links">
+              <a href="${r.view_url}" target="_blank">View in Immich</a>
+              <a href="${r.download_url}">Download</a>
+            </div>
+          `;
+          results.appendChild(div);
+        }
+      } catch (err) {
+        const elapsedMs = Math.round(performance.now() - startTime);
+        console.error(`[search] failed after ${elapsedMs}ms:`, err);
+        status.textContent = 'Network error — is search-api reachable?';
+      }
+    });
+  </script>
+</body>
+</html>
