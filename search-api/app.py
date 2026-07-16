@@ -46,6 +46,11 @@ def index():
     return render_template("search.html")
 
 
+@app.route("/debug")
+def debug():
+    return render_template("search_debug.html")
+
+
 @app.route("/health")
 def health():
     return jsonify({
@@ -75,9 +80,11 @@ def search():
         parsed = rules.parse_query(text)
         person_ids = [pid for pid in (immich.find_person_id(n)
                                       for n in parsed.person_names) if pid]
+        people = {"ids": person_ids, "match": "all"} if person_ids else None
+        cities = {"values": [parsed.location], "match": "any"} if parsed.location else None
         asset_ids = tools_mod.run_ranked_search(
-            immich, object_query=parsed.object_query, person_ids=person_ids,
-            city=parsed.location, date_from=parsed.date_from, date_to=parsed.date_to,
+            immich, object_query=parsed.object_query, people=people,
+            cities=cities, date_from=parsed.date_from, date_to=parsed.date_to,
         )
         explanation = "Rule-based parser (search agent not configured)."
         trace = []
