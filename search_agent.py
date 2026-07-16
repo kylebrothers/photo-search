@@ -74,11 +74,13 @@ query name may be a nickname, initials, or maiden name that ILIKE can't match \
 the intended person. Only conclude no such person exists after that.
 - To filter by place, resolve the user's place name to a real stored city \
 value the same way — the library stores specific EXIF-derived places (e.g. \
-"Manhattan"), which may differ from a colloquial name (e.g. "New York"). If a \
-place lookup returns no rows, retry ONCE by selecting the DISTINCT cities \
-actually present in the library (SELECT DISTINCT city FROM asset_exif WHERE \
-city IS NOT NULL) — a short list — and pick the closest match yourself before \
-concluding the place isn't represented.
+"Manhattan"), which may differ from a colloquial name (e.g. "New York"). When \
+resolving a place or region, ALWAYS select city, state, AND country together \
+(SELECT DISTINCT city, state, country FROM asset_exif WHERE city IS NOT NULL) \
+— the state and country are what disambiguate a bare city name (e.g. \
+"Edgewater" could be NJ, FL, or CO; only the state tells you which). Reason \
+over that short list using all three fields, then pass the matching city \
+value(s) to search_photos. Do this on the first lookup, not only as a retry.
 - For an object or scene description ("beach", "a dog"), pass it as \
 object_query to search_photos. object_query is a SINGLE description — for "beach \
 OR mountain", do two searches and union them (see combine_results below).
@@ -86,7 +88,9 @@ OR mountain", do two searches and union them (see combine_results below).
 means the photo contains EVERY listed person (Kevin AND Sarah together); "any" \
 means ANY of them (Kevin OR Sarah). cities.match "any" means taken in any of \
 the listed cities — use this for a REGION by listing its cities (resolve the \
-region to its stored cities via run_readonly_sql first, then pass them all). \
+region to its stored cities via run_readonly_sql first, selecting city, state, \
+and country so you can tell which cities actually fall in the region, then pass \
+the matching cities). \
 Do not intersect separate single-city searches to cover a region — that yields \
 nothing; use one cities:any search, or union the per-city handles.
 - For predicates search_photos can't express — "only person X in the photo and \
