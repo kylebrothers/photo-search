@@ -26,17 +26,14 @@ def find_unresolved(limit=None):
     """
     Query Immich's own database for photos with coordinates but no city.
 
-    UNVERIFIED: table/column names below (exif.assetId, exif.latitude,
-    exif.longitude, exif.city) are best-effort -- confirmed the table is
-    named `exif` (not `asset_exif`, an earlier assumption in the design doc)
-    from a real UPDATE statement in an Immich GitHub discussion, but the
-    full column list has NOT been checked against the live schema (in psql,
-    run: describe exif  -- or the equivalent "d plus" shorthand). Verify
-    before the first real run (same caveat as
-    search-api/db.py).
+    CONFIRMED against the live instance on 2026-07 via `\d+ asset_exif`:
+    table is `asset_exif` (the design doc's original assumption was right;
+    an intermediate correction to `exif` based on a GitHub discussion was
+    wrong for this Immich version). Columns assetId/latitude/longitude/city
+    all present as used below.
     """
     query = (
-        'SELECT "assetId", latitude, longitude FROM exif '
+        'SELECT "assetId", latitude, longitude FROM asset_exif '
         "WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND city IS NULL"
     )
     if limit:
