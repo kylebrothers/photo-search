@@ -126,16 +126,65 @@ embedding backfills. Any batch model must fit alongside that or be scheduled to
 avoid overlap (same contention caveat as the retired Ollama service). This is a
 real constraint on model choice and concurrency.
 
+## Process & infrastructure decisions (2026-07-17)
+
+Settled ahead of schema/pipeline work, before the newly-added photo backlog
+finishes indexing:
+
+- **Two containers.** `search-api` (prod) stays completely sidecar-blind —
+  no dependency on the sidecar code or DB. A separate `search-api-dev`
+  container (same image/codebase, different config) is where sidecar
+  integration is built and tested. Prod is never at risk from in-progress
+  sidecar work.
+- **Sidecar databases: separate Postgres databases, both dev and prod, on
+  the same Postgres instance as Immich's own DB** (not a schema inside
+  Immich's database — rejected due to coupling to Immich's migration/restore
+  lifecycle).
+  - **Dev (`sidecar_dev`):** no backup. Wipe-and-redevelop freely
+    (`DROP DATABASE` + re-run migrations) — disposability is the point.
+  - **Prod (`sidecar_prod`, built later):** will need its own backup
+    mechanism, since it won't ride along in Immich's existing backup job the
+    way a same-database schema would have. Flagged as a real task for the
+    prod-migration step, not solved yet.
+- **Repo layout.** `sidecar/` is a top-level folder, sibling to `search-api/`
+  (mirrors how `gpu-ml` got its own repo for the same separation-of-concerns
+  reason), not nested inside `search-api/`.
+- **Schema shape.** Per-tool typed tables (`resolved_geo`, `object_counts`,
+  `landmark_matches`, ...) rather than a generic EAV key/value table — chosen
+  for SQL-agent reliability: typed columns are far easier for LLM-generated
+  SQL to query correctly than a self-joined `key`/`value` table. A separate
+  `enrichment_status(asset_id, tool, model_version, status)` table is written
+  unconditionally on every enrichment run, so "zero facts produced" (a valid
+  result, e.g. zero detected objects) is distinguishable from "never
+  processed" — and also drives the "what needs enrichment" query.
+- **UUID stability caveat.** Immich UUIDs are not move-proof: moving a file,
+  even within one external library, causes Immich to treat it as a new asset
+  on rescan (known Immich issue), and moving across external libraries
+  produces a duplicate with the old entry marked offline. Policy: don't try
+  to track this — reaugment under the new UUID when it appears (enrichment is
+  idempotent and cheap on the overnight GPU batch). Dead/offline duplicate
+  entries are cleaned up via Immich's own **"Remove offline files"** job
+  (admin Jobs page), run periodically — no custom reconciliation script
+  needed.
+- **Dev test set.** A fixed, pinned ~100-photo sample plus a handful of
+  hand-picked hard cases (e.g. the 4 Disney no-city photos, a known
+  multi-face photo), stored in `sidecar.test_set` with a `label` column
+  distinguishing `'random'` fill from `'hard_case:...'` entries. Chosen over
+  a fresh-random-sample-per-run so approach/model changes are comparable
+  over time.
+
 ## First steps for the new chat
 
 1. **Measure the real gap.** On the real (non-sample) library, how many photos
    have coordinates but no city? That sizes whether reverse-geocode enrichment
    (option A) is worth building now. Also: `count(*)` of photos total, to gauge
-   overnight batch feasibility.
-2. **Design the side-car schema.** UUID-keyed, open-ended for many fact-types,
-   insulated from Immich's schema. Decide per-tool tables vs. typed key/value.
-   Decide where it lives (its own Postgres DB? a table in a separate DB? not
-   Immich's DB).
+   overnight batch feasibility. *(Blocked on the newly-added backlog finishing
+   indexing as of 2026-07-17.)*
+2. **Design the side-car schema.** ~~UUID-keyed, open-ended for many
+   fact-types, insulated from Immich's schema. Decide per-tool tables vs.
+   typed key/value. Decide where it lives.~~ **Done** — see "Process &
+   infrastructure decisions" above; DDL exists in
+   `sidecar/migrations/001_initial_schema.sql`.
 3. **Design the ingest/enrichment pipeline.** How new photos (and manual edits)
    get picked up, queued, processed on the `gpu-ml` box, and written to the
    side-car. Batch, idempotent, resumable — mirror the lessons from the search
@@ -145,7 +194,8 @@ real constraint on model choice and concurrency.
    queryable. Re-run the relevant parts of the manual test batch.
 5. **Pick the first enrichment to build** — reverse-geocode (A) and/or object
    detection (person counts), the two with the clearest, already-motivated
-   payoff.
+   payoff. *(Leaning reverse-geocode first: smallest, lowest GPU cost, proves
+   the pipeline end-to-end regardless of library size.)*
 
 ## Pointers into existing code/docs
 
@@ -158,3 +208,5 @@ real constraint on model choice and concurrency.
   alongside `immich-machine-learning` (Ollama there is now retired/dead-ended).
 - `search-api/landmark/` — the existing curated CLIP-embedding landmark matcher
   that DELF/DELG would layer onto, not replace.
+- `sidecar/` — the side-car codebase itself (migrations, `db.py`, `config.py`,
+  `test_set.py`, `enrichment/`), sibling to `search-api/`.
