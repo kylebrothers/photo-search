@@ -102,3 +102,15 @@ class ImmichClient:
         )
         r.raise_for_status()
         return r
+
+    def reverse_geocode(self, lat, lon):
+        """
+        GET /map/reverse-geocode — requires the map.search permission on the
+        API key. Confirmed against Immich's own source (map.repository.ts,
+        ReverseGeocodeResult) as of 2026-07: response is a list with one
+        object shaped {city, state, country}, each str or None. Uses
+        Immich's real GeoNames-backed matcher (see sidecar-augmentation.md,
+        option A) rather than reimplementing geocoding.
+        """
+        results = self._get("/map/reverse-geocode", params={"lat": lat, "lon": lon})
+        return results[0] if results else {"city": None, "state": None, "country": None}
