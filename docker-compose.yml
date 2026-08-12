@@ -24,11 +24,9 @@ services:
       - postgres
     restart: unless-stopped
 
-
   redis:
     image: docker.io/redis:6.2-alpine
     restart: unless-stopped
-
 
   postgres:
     # Verify this tag against Immich's current example compose file for
@@ -43,7 +41,6 @@ services:
       - ${DB_DATA_LOCATION}:/var/lib/postgresql/data   # local SSD bind mount — never NFS, never a Docker NFS volume
     restart: unless-stopped
 
-
   search-api:
     build: ./search-api
     env_file: .env
@@ -56,6 +53,26 @@ services:
       - immich-server
     restart: unless-stopped
 
+  # Sidecar development container. Same image/codebase as search-api (prod),
+  # different config — prod never sets SIDECAR_DB_DSN or mounts sidecar/, so
+  # it stays completely sidecar-blind. This is where sidecar integration is
+  # built and tested; sidecar_dev is wipe-and-redevelop freely (see
+  # docs/sidecar-augmentation.md, "Process & infrastructure decisions").
+  search-api-dev:
+    build: ./search-api
+    env_file: .env
+    environment:
+      - IMMICH_URL=http://immich-server:2283
+      - IMMICH_DB_DSN=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/${DB_DATABASE_NAME}
+      - SIDECAR_DB_DSN=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/sidecar_dev
+      - PYTHONPATH=/app:/app/sidecar
+    volumes:
+      - ./sidecar:/app/sidecar
+    ports:
+      - "5001:5000"
+    depends_on:
+      - immich-server
+    restart: unless-stopped
 
 volumes:
   # NFS-backed Docker volume — Docker mounts this directly, no host-level
