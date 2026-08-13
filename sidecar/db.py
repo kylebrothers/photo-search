@@ -8,7 +8,7 @@ from . import config
 
 
 def get_connection():
-    return psycopg2.connect(config.SIDECAR_DB_DSN)
+    return psycopg2.connect(**config.sidecar_db_kwargs())
 
 
 def run_migrations(migrations_dir="migrations"):

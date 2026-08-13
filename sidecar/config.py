@@ -1,19 +1,35 @@
 import os
 
-# Dev sidecar DB. Separate from Immich's own Postgres (see search-api/config.py
-# SQL_READONLY_DSN) and separate from any future production sidecar DB.
-# Wipe-and-redevelop freely; the prod search-api container never sets or reads
-# this variable.
-SIDECAR_DB_DSN = os.environ.get("SIDECAR_DB_DSN", "")
+# Shared Postgres connection parameters -- one physical Postgres instance
+# hosts both Immich's own database and the sidecar databases. Kept as
+# individual host/port/user/password components rather than a single DSN
+# string: DSN strings require percent-encoding special characters in the
+# password, and the real password here contains characters (%, !) that broke
+# a plain DSN string on first real use (psycopg2 tried to parse "%C" as a
+# percent-encoded escape). psycopg2.connect(**kwargs) handles special
+# characters in passwords natively, with no encoding step required, ever.
+DB_HOST = os.environ.get("DB_HOST", "postgres")
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_USER = os.environ.get("DB_USER", "")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+
+# Database names on that shared instance.
+IMMICH_DB_NAME = os.environ.get("IMMICH_DB_NAME", "immich")
+SIDECAR_DB_NAME = os.environ.get("SIDECAR_DB_NAME", "sidecar_dev")
 
 # Row cap for ad-hoc reads against the sidecar (mirrors search-api's
-# SQL_ROW_CAP pattern) — not yet wired to a query tool, kept for when the
+# SQL_ROW_CAP pattern) -- not yet wired to a query tool, kept for when the
 # sidecar is exposed to the search agent.
 SIDECAR_ROW_CAP = int(os.environ.get("SIDECAR_ROW_CAP", "100"))
 
-# Immich's own database — read-only access, needed by enrichment jobs that
-# find their own work (e.g. reverse_geocode.py scanning for coords-without-
-# city photos) rather than being handed a list. Same DSN search-api/db.py
-# already uses; duplicated here so sidecar/ has no import dependency on
-# search-api/.
-IMMICH_DB_DSN = os.environ.get("IMMICH_DB_DSN", "")
+
+def sidecar_db_kwargs():
+    """psycopg2.connect(**kwargs) for the sidecar database."""
+    return dict(host=DB_HOST, port=DB_PORT, user=DB_USER,
+                password=DB_PASSWORD, dbname=SIDECAR_DB_NAME)
+
+
+def immich_db_kwargs():
+    """psycopg2.connect(**kwargs) for Immich's own database (read-only use)."""
+    return dict(host=DB_HOST, port=DB_PORT, user=DB_USER,
+                password=DB_PASSWORD, dbname=IMMICH_DB_NAME)
