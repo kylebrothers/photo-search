@@ -4,7 +4,7 @@ migrations/001_initial_schema.sql). Not Immich's database; see
 search-api/db.py for that.
 """
 import psycopg2
-import config
+from . import config
 
 
 def get_connection():
