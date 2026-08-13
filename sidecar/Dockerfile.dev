@@ -1,0 +1,37 @@
+# Dockerfile for search-api-dev only. Lives in sidecar/ (not search-api/) to
+# keep it visibly separate from prod's own Dockerfile -- prod is built with
+# search-api/Dockerfile and never sees this file or sidecar/requirements.txt.
+#
+# Build context must be the repo root (not ./search-api), since this needs
+# to COPY from both search-api/ and sidecar/. See docker-compose.yml:
+#   search-api-dev:
+#     build:
+#       context: .
+#       dockerfile: sidecar/Dockerfile.dev
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Base (prod) requirements first, then sidecar-only additions as a separate
+# layer -- edits to sidecar/requirements.txt don't invalidate the (larger,
+# slower-to-rebuild) base layer.
+COPY search-api/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY sidecar/requirements.txt ./sidecar-requirements.txt
+RUN pip install --no-cache-dir -r sidecar-requirements.txt
+
+# search-api/ code is baked into the image, same as prod.
+COPY search-api/ .
+
+# sidecar/ code is NOT copied here -- it's volume-mounted at runtime instead
+# (see docker-compose.yml: ./sidecar:/app/sidecar). Keeps sidecar code
+# iteration fast (no rebuild needed for a plain code change) and matches how
+# prod's image never bakes in sidecar/ code either.
+
+EXPOSE 5000
+
+# See search-api/Dockerfile for the --timeout 90 rationale (Ollama request
+# timeout headroom) -- same constraint applies here, same base image.
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "90", "app:app"]

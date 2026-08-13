@@ -1,0 +1,8 @@
+# Sidecar-only dependencies -- NOT installed in the prod search-api image
+# (see sidecar/Dockerfile.dev). Kept separate from search-api/requirements.txt
+# so prod stays completely sidecar-blind, per docs/sidecar-augmentation.md.
+
+# duckdb: point-in-polygon queries against Overture Maps' open Divisions
+# dataset (overture_geocode.py), via its spatial and httpfs extensions
+# (loaded at runtime with INSTALL/LOAD, not separate pip packages).
+duckdb==1.5.2
