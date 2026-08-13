@@ -58,6 +58,13 @@ services:
   # it stays completely sidecar-blind. This is where sidecar integration is
   # built and tested; sidecar_dev is wipe-and-redevelop freely (see
   # docs/sidecar-augmentation.md, "Process & infrastructure decisions").
+  #
+  # PYTHONPATH is just /app, NOT /app:/app/sidecar -- sidecar/ is a real
+  # package (sidecar/__init__.py) with relative internal imports, so adding
+  # /app/sidecar to the path would make its db.py/config.py importable bare
+  # again, re-colliding with search-api's own db.py/config.py (the bug that
+  # broke the first smoke test run). Invoke enrichment scripts as
+  # `python -m sidecar.run_reverse_geocode`, not as a bare script path.
   search-api-dev:
     build: ./search-api
     env_file: .env
@@ -65,7 +72,7 @@ services:
       - IMMICH_URL=http://immich-server:2283
       - IMMICH_DB_DSN=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/${DB_DATABASE_NAME}
       - SIDECAR_DB_DSN=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/sidecar_dev
-      - PYTHONPATH=/app:/app/sidecar
+      - PYTHONPATH=/app
     volumes:
       - ./sidecar:/app/sidecar
     ports:
