@@ -1,15 +1,8 @@
 """
 Manages the fixed, pinned dev test set (sidecar.test_set table): 100 photos
 + hand-picked hard cases, so enrichment approaches are comparable across runs.
-
-Not yet implemented — stub reflects the agreed shape (README-adjacent design
-chat, sidecar-augmentation.md). TODO before this is usable:
-  - populate(): pick 100 asset_ids from Immich (random or stratified — TBD)
-    plus known hard cases (e.g. the 4 Disney no-city photos), write them here
-    with an appropriate `label`.
-  - get(label=None): return asset_ids, optionally filtered to one label.
 """
-import db
+from . import db
 
 
 def get(label=None):
@@ -29,8 +22,10 @@ def populate(random_asset_ids, hard_cases=None):
     """
     random_asset_ids: iterable of ~100 asset_id strings to label 'random'.
     hard_cases: dict of {asset_id: label}, e.g.
-        {"<uuid>": "hard_case:disney_no_city"}.
-    TODO: wire up the actual selection logic (see module docstring).
+        {"<uuid>": "hard_case:multi_face"}.
+    Idempotent: random uses ON CONFLICT DO NOTHING (won't duplicate or
+    relabel an existing row), hard_cases uses ON CONFLICT DO UPDATE (so a
+    hard case's label can be corrected on rerun without a manual delete).
     """
     hard_cases = hard_cases or {}
     with db.get_connection() as conn:
