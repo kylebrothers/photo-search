@@ -19,7 +19,7 @@ MODEL_VERSION = "immich-api-v1"
 
 
 def _get_immich_connection():
-    return psycopg2.connect(config.IMMICH_DB_DSN)
+    return psycopg2.connect(**config.immich_db_kwargs())
 
 
 def find_unresolved(limit=None):
