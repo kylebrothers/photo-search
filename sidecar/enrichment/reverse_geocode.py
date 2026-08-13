@@ -9,8 +9,8 @@ model) so the schema stays honest if a different geocoder is swapped in later.
 import logging
 import psycopg2
 
-import config
-import db as sidecar_db
+from .. import config
+from .. import db as sidecar_db
 
 logger = logging.getLogger(__name__)
 
