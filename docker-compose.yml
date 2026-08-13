@@ -54,10 +54,10 @@ services:
     restart: unless-stopped
 
   # Sidecar development container. Same image/codebase as search-api (prod),
-  # different config — prod never sets SIDECAR_DB_DSN or mounts sidecar/, so
-  # it stays completely sidecar-blind. This is where sidecar integration is
-  # built and tested; sidecar_dev is wipe-and-redevelop freely (see
-  # docs/sidecar-augmentation.md, "Process & infrastructure decisions").
+  # different config — prod never sets sidecar-related env vars or mounts
+  # sidecar/, so it stays completely sidecar-blind. This is where sidecar
+  # integration is built and tested; sidecar_dev is wipe-and-redevelop freely
+  # (see docs/sidecar-augmentation.md, "Process & infrastructure decisions").
   #
   # PYTHONPATH is just /app, NOT /app:/app/sidecar -- sidecar/ is a real
   # package (sidecar/__init__.py) with relative internal imports, so adding
@@ -70,8 +70,18 @@ services:
     env_file: .env
     environment:
       - IMMICH_URL=http://immich-server:2283
-      - IMMICH_DB_DSN=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/${DB_DATABASE_NAME}
-      - SIDECAR_DB_DSN=postgresql://${DB_USERNAME}:${DB_PASSWORD}@postgres:5432/sidecar_dev
+      # Individual connection params, not a combined DSN string -- the real
+      # Postgres password contains characters (%, !) that a DSN string
+      # requires percent-encoding, which this plain env-var interpolation
+      # doesn't do. psycopg2.connect(**kwargs) in sidecar/config.py handles
+      # these values as literal strings, no encoding needed. Broke a real
+      # test run 2026-08; see sidecar/config.py for the fix.
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - IMMICH_DB_NAME=${DB_DATABASE_NAME}
+      - SIDECAR_DB_NAME=sidecar_dev
       - PYTHONPATH=/app
     volumes:
       - ./sidecar:/app/sidecar
