@@ -53,11 +53,18 @@ services:
       - immich-server
     restart: unless-stopped
 
-  # Sidecar development container. Same image/codebase as search-api (prod),
-  # different config — prod never sets sidecar-related env vars or mounts
-  # sidecar/, so it stays completely sidecar-blind. This is where sidecar
-  # integration is built and tested; sidecar_dev is wipe-and-redevelop freely
-  # (see docs/sidecar-augmentation.md, "Process & infrastructure decisions").
+  # Sidecar development container. Same base codebase as search-api (prod),
+  # different config AND a different (superset) image build -- prod never
+  # sets sidecar-related env vars, never mounts sidecar/, and never installs
+  # sidecar/requirements.txt, so it stays completely sidecar-blind. This is
+  # where sidecar integration is built and tested; sidecar_dev is
+  # wipe-and-redevelop freely (see docs/sidecar-augmentation.md, "Process &
+  # infrastructure decisions").
+  #
+  # build.context is the repo root (not ./search-api like prod), because
+  # sidecar/Dockerfile.dev needs to COPY from both search-api/ and sidecar/
+  # (specifically sidecar/requirements.txt, for sidecar-only Python deps
+  # like duckdb -- see sidecar/Dockerfile.dev for the layer rationale).
   #
   # PYTHONPATH is just /app, NOT /app:/app/sidecar -- sidecar/ is a real
   # package (sidecar/__init__.py) with relative internal imports, so adding
@@ -66,7 +73,9 @@ services:
   # broke the first smoke test run). Invoke enrichment scripts as
   # `python -m sidecar.run_reverse_geocode`, not as a bare script path.
   search-api-dev:
-    build: ./search-api
+    build:
+      context: .
+      dockerfile: sidecar/Dockerfile.dev
     env_file: .env
     environment:
       - IMMICH_URL=http://immich-server:2283
