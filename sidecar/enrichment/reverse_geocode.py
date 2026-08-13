@@ -46,11 +46,20 @@ def find_unresolved(limit=None):
 
 
 def _already_done(asset_id):
+    """
+    True only if a prior run succeeded for this asset/tool/model_version.
+    Deliberately does NOT match 'failed' rows -- those should be retried by
+    skip_done, per run()'s docstring. (Bug found 2026-08: an earlier version
+    matched on row existence alone, so a failed first attempt permanently
+    blocked all retries -- surfaced by "0 photo(s) processed" on a rerun
+    with 5 real candidates and no error output.)
+    """
     with sidecar_db.get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM enrichment_status "
-                "WHERE asset_id = %s AND tool = %s AND model_version = %s;",
+                "WHERE asset_id = %s AND tool = %s AND model_version = %s "
+                "AND status = 'done';",
                 (asset_id, TOOL, MODEL_VERSION),
             )
             return cur.fetchone() is not None
