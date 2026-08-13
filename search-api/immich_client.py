@@ -105,12 +105,23 @@ class ImmichClient:
 
     def reverse_geocode(self, lat, lon):
         """
-        GET /map/reverse-geocode — requires the map.search permission on the
-        API key. Confirmed against Immich's own source (map.repository.ts,
-        ReverseGeocodeResult) as of 2026-07: response is a list with one
-        object shaped {city, state, country}, each str or None. Uses
-        Immich's real GeoNames-backed matcher (see sidecar-augmentation.md,
-        option A) rather than reimplementing geocoding.
+        GET /api/map/reverse-geocode -- corrected 2026-08 after a live 404
+        (an earlier "confirmed from source" claim only verified the response
+        *shape*, never the actual request path against a working call; the
+        bare /map/reverse-geocode path silently landed on Immich's frontend
+        SPA fallback, returning 200 + HTML rather than a real 404).
+        Response: a list with one object shaped {city, state, country}, each
+        str or None (server/src/services/map.service.ts, confirmed via
+        Immich's route log showing all API routes live under /api/...).
+
+        Known Immich bug (github.com/immich-app/immich issue #24896, open as
+        of 2025-12): this endpoint silently requires Permission.All on the
+        API key regardless of what's actually granted -- a scoped/limited
+        key gets a 403. Not an issue for a full-access key.
+
+        Uses Immich's real GeoNames-backed matcher (see
+        sidecar-augmentation.md, option A) rather than reimplementing
+        geocoding.
         """
-        results = self._get("/map/reverse-geocode", params={"lat": lat, "lon": lon})
+        results = self._get("/api/map/reverse-geocode", params={"lat": lat, "lon": lon})
         return results[0] if results else {"city": None, "state": None, "country": None}
