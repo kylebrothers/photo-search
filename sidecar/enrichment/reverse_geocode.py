@@ -49,7 +49,12 @@ def find_unresolved(scope="test"):
         test_asset_ids = [row[0] for row in test_set.get()]
         if not test_asset_ids:
             return []
-        query += ' AND "assetId" = ANY(%s)'
+        # Explicit ::uuid[] cast -- without it, psycopg2's array adaptation
+        # of a Python list of UUID objects does not reliably produce a
+        # uuid[] array, so Postgres compares "assetId" (uuid) against a
+        # text[] array and raises "operator does not exist: uuid = text".
+        # Confirmed via a live failure 2026-08.
+        query += ' AND "assetId" = ANY(%s::uuid[])'
         params = (test_asset_ids,)
     elif scope != "full":
         raise ValueError(f"scope must be 'test' or 'full', got {scope!r}")
