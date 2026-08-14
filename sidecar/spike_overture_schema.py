@@ -21,6 +21,12 @@ offshore point against any land polygon, however dense the data is. This is
 the real reason immich-reversegeo's docs claim better coastline handling:
 that only makes sense as nearest-polygon matching, not containment. This
 spike checks whether that theory holds for our specific test coordinate.
+
+2026-08 update 2: added a bbox prefilter to the containment query too --
+without it, ST_Contains scanned Overture's ENTIRE global division_area
+dataset with no spatial index, which made the first run of this script
+appear to hang. Any polygon containing the point must also have a bbox
+overlapping it, so the prefilter can't drop a real match.
 """
 import duckdb
 
@@ -35,11 +41,12 @@ DIVISION_AREA_PATH = (
 # -- confirmed via manual map check to be real wilderness, no nearby town).
 TEST_LAT, TEST_LON = 57.501833, -132.844983
 
-# Bounding-box prefilter for the nearest-polygon query, in degrees. Avoids a
-# full-table scan of Overture's global division_area dataset for every
-# ST_Distance computation -- only rows whose bbox is within this margin of
-# the test point are distance-checked at all. ~0.5 degrees is roughly 35-55km
-# at this latitude, generously wide for finding "the nearest land."
+# Bounding-box prefilter margin for the nearest-polygon query, in degrees.
+# Avoids a full-table scan of Overture's global division_area dataset for
+# every ST_Distance computation -- only rows whose bbox is within this
+# margin of the test point are distance-checked at all. ~0.5 degrees is
+# roughly 35-55km at this latitude, generously wide for finding "the
+# nearest land."
 BBOX_MARGIN_DEGREES = 0.5
 
 
@@ -68,11 +75,19 @@ def main():
         print(f"  {row}")
 
     print(f"\n--- Strict containment (ST_Contains) for ({TEST_LAT}, {TEST_LON}) ---")
+    # Bbox-prefiltered, same as the nearest-polygon query below -- without
+    # this, ST_Contains scans Overture's ENTIRE global division_area dataset
+    # with no spatial index, which is what made the first run of this script
+    # appear to hang (it was just doing far more work than needed, over the
+    # network, on the Pi). Any polygon containing the point must also have a
+    # bbox overlapping it, so this prefilter can't drop a real match.
     contains_result = con.execute(
         f"""
         SELECT id, subtype, names, country
         FROM read_parquet('{DIVISION_AREA_PATH}', hive_partitioning=1)
-        WHERE ST_Contains(geometry, ST_Point({TEST_LON}, {TEST_LAT}))
+        WHERE bbox.xmin <= {TEST_LON} AND bbox.xmax >= {TEST_LON}
+          AND bbox.ymin <= {TEST_LAT} AND bbox.ymax >= {TEST_LAT}
+          AND ST_Contains(geometry, ST_Point({TEST_LON}, {TEST_LAT}))
         ORDER BY CASE subtype
             WHEN 'locality' THEN 1
             WHEN 'county' THEN 2
