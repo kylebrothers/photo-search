@@ -11,6 +11,7 @@ import psycopg2
 
 from .. import config
 from .. import db as sidecar_db
+from .. import test_set
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +23,15 @@ def _get_immich_connection():
     return psycopg2.connect(**config.immich_db_kwargs())
 
 
-def find_unresolved(limit=None):
+def find_unresolved(scope="test"):
     """
     Query Immich's own database for photos with coordinates but no city.
+
+    scope='test' (default): only candidates within the pinned test_set (see
+    sidecar/test_set.py) -- keeps dev runs comparable across approaches/
+    reruns. scope='full': every unresolved candidate in the library --
+    should be a deliberate, explicit choice (see run_reverse_geocode.py
+    --scope), never the silent default.
 
     CONFIRMED against the live instance on 2026-07 via `\d+ asset_exif`:
     table is `asset_exif` (the design doc's original assumption was right;
@@ -36,12 +43,20 @@ def find_unresolved(limit=None):
         'SELECT "assetId", latitude, longitude FROM asset_exif '
         "WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND city IS NULL"
     )
-    if limit:
-        query += f" LIMIT {int(limit)}"
+    params = ()
+
+    if scope == "test":
+        test_asset_ids = [row[0] for row in test_set.get()]
+        if not test_asset_ids:
+            return []
+        query += ' AND "assetId" = ANY(%s)'
+        params = (test_asset_ids,)
+    elif scope != "full":
+        raise ValueError(f"scope must be 'test' or 'full', got {scope!r}")
 
     with _get_immich_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query)
+            cur.execute(query, params)
             return cur.fetchall()  # [(asset_id, lat, lon), ...]
 
 
@@ -99,18 +114,17 @@ def _write_result(asset_id, geo, error=None):
         conn.commit()
 
 
-def run(immich_client, limit=None, skip_done=True):
+def run(immich_client, scope="test", skip_done=True):
     """
     Main entry point. immich_client: an ImmichClient instance (see
     search-api/immich_client.py, .reverse_geocode(lat, lon)).
 
-    limit: cap on how many unresolved photos to process this run (useful for
-    the pinned 100-photo dev test set, or a conservative first pass).
+    scope: 'test' (pinned test_set, default) or 'full' (entire library).
     skip_done: skip asset_ids already marked 'done' for this tool/model_version
     (idempotent reruns -- 'failed' rows are retried).
     """
-    candidates = find_unresolved(limit=limit)
-    logger.info(f"reverse_geocode: {len(candidates)} candidate photo(s) found")
+    candidates = find_unresolved(scope=scope)
+    logger.info(f"reverse_geocode: {len(candidates)} candidate photo(s) found (scope={scope})")
 
     processed = 0
     for asset_id, lat, lon in candidates:
