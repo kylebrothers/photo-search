@@ -31,17 +31,31 @@ CREATE INDEX idx_enrichment_status_tool ON enrichment_status (tool, status);
 
 -- Reverse-geocode gap fill: coords-with-no-city photos, resolved via
 -- Immich's own /map/reverse-geocode endpoint (option A from the design note)
--- rather than reimplementing geocoding.
+-- and/or a richer polygon-based source (e.g. Overture Divisions -- see
+-- overture_geocode.py) for cases Immich's own GeoNames-backed matcher
+-- misses entirely (confirmed 2026-08: Immich returned no state at all for a
+-- real Alaska coordinate that Overture correctly resolved to county/state/
+-- country).
+--
+-- county is nullable and, as of 2026-08, only ever populated by an
+-- Overture-based enrichment -- Immich's own geocoder (source =
+-- 'immich_reverse_geocode') has no concept of county and will always leave
+-- it null. Added specifically because "county but no locality/city" is a
+-- common, real, search-worthy case for rural/unincorporated areas (e.g.
+-- Alaska's "Unorganized Borough" designations, and rural Kentucky counties
+-- with no incorporated city nearby) -- not an edge case to drop silently.
 CREATE TABLE resolved_geo (
     asset_id    uuid PRIMARY KEY,
     city        text,
+    county      text,
     state       text,
     country     text,
-    source      text NOT NULL,            -- e.g. 'immich_reverse_geocode'
+    source      text NOT NULL,            -- e.g. 'immich_reverse_geocode', 'overture_divisions'
     computed_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_resolved_geo_city ON resolved_geo (city);
+CREATE INDEX idx_resolved_geo_county ON resolved_geo (county);
 
 
 -- Object/person/animal counts, open-vocabulary (YOLO-World candidate).
