@@ -7,9 +7,12 @@ sidecar/__init__.py), and its internal imports (config, db) are relative,
 so they only resolve correctly when Python treats sidecar/ as a package
 rather than putting it directly on sys.path:
 
-    docker exec -it <search-api-dev container> python -m sidecar.run_reverse_geocode --limit 5
+    docker exec -it <search-api-dev container> python -m sidecar.run_reverse_geocode --scope test
 
-Start with a small --limit for the first smoke test before running unbounded.
+--scope defaults to 'test' (the pinned ~100-photo test_set) -- running
+against the full library is a deliberate, explicit choice:
+
+    docker exec -it <search-api-dev container> python -m sidecar.run_reverse_geocode --scope full
 """
 import argparse
 import logging
@@ -20,8 +23,8 @@ from .enrichment import reverse_geocode
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=None,
-                         help="Max photos to process this run (omit for no limit)")
+    parser.add_argument("--scope", choices=["test", "full"], default="test",
+                         help="'test' = pinned test_set only (default), 'full' = entire library")
     parser.add_argument("--no-skip-done", action="store_true",
                          help="Reprocess photos already marked done for this tool/model_version")
     args = parser.parse_args()
@@ -29,7 +32,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     client = ImmichClient()
-    processed = reverse_geocode.run(client, limit=args.limit, skip_done=not args.no_skip_done)
+    processed = reverse_geocode.run(client, scope=args.scope, skip_done=not args.no_skip_done)
     print(f"Done. {processed} photo(s) processed.")
 
 
