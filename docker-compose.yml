@@ -91,6 +91,10 @@ services:
       - DB_PASSWORD=${DB_PASSWORD}
       - IMMICH_DB_NAME=${DB_DATABASE_NAME}
       - SIDECAR_DB_NAME=sidecar_dev
+      # gpu-ml's generic inference service (object_detect.py). Points at
+      # the gpu-ml device's real LAN address -- set the actual value in
+      # .env, same pattern as IMMICH_MACHINE_LEARNING_URL above.
+      - INFERENCE_SERVICE_URL=${INFERENCE_SERVICE_URL}
       - PYTHONPATH=/app
     volumes:
       - ./sidecar:/app/sidecar
