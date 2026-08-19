@@ -1,10 +1,13 @@
 # Photo Metadata Augmentation — Side-car Database (design note)
 
-**Status:** design/scoping, nothing built. This note seeds a dedicated chat.
-It captures (a) the decision to build a UUID-keyed side-car store that augments
-Immich's data without writing back into it, and (b) the GPU-model candidates
-for *producing* that augmentation data, carried over from the "Local GPU for
-image labeling augmentation" discussion.
+**Status (2026-08):** core infrastructure built and proven on the dev test
+set. Three enrichment tools working end-to-end: reverse-geocoding (two
+sources), object detection, and a generic reusable GPU inference protocol.
+Landmark matching (dual-source: visual + geospatial proximity) is designed,
+with the visual model now chosen (DINOv3 — see below), but not yet built —
+next up. This note is the living record of what's built, why, and what's
+next; update it as things change rather than letting chat history be the
+only record.
 
 ---
 
@@ -29,7 +32,7 @@ of gap remain, and both point at the same solution:
 Both are the same shape: **per-photo facts that should be computed once and
 stored somewhere the search agent can query.** That store is the side-car.
 
-## Core design decisions (agreed in the search-agent chat)
+## Core design decisions (agreed early, still holding)
 
 - **Key everything on the Immich asset UUID.** Photos move, get re-organized,
   and enter uncontrolled from a shared Dropbox folder. The asset UUID is the
@@ -45,168 +48,276 @@ stored somewhere the search agent can query.** That store is the side-car.
     A separate store owned by us is insulated from Immich upgrades.
 - **Open-ended by design.** The goal is not one feature but a framework: many
   future tools, each contributing a different kind of per-photo fact, all keyed
-  by UUID. Schema should accommodate new fact-types without migration churn
-  (e.g. a typed key/value or per-tool table pattern, TBD in the new chat).
+  by UUID.
 - **Feeds the existing agent.** Augmentation data becomes queryable by
   `run_readonly_sql` (and potentially new structured `search_photos` filters),
   so the agent gains real structured facts instead of inferring frame contents
-  indirectly. This is the natural extension of why the raw-SQL tool exists.
+  indirectly. **Not yet done** — see "Next steps."
 
-## Reverse-geocoding gap — the immediate motivating case
+## Implementation status (2026-08)
 
-Immich reverse-geocodes only during EXIF extraction, using the GeoNames data in
-its own Postgres (`geodata_places`, ~227k rows on this instance; no PostGIS).
-Manual coordinate edits never retrigger it, so coordinates-with-no-city photos
-stay unreachable by place search.
+What's actually built and proven, mapped to real files:
 
-Options considered (decide in the new chat, ideally after measuring the real-
-data gap — on sample data it was only 2 of 15 coords-bearing photos):
+| Enrichment | File(s) | Status | Notes |
+|---|---|---|---|
+| Reverse-geocode (Immich's own geocoder) | `sidecar/enrichment/reverse_geocode.py` | Working, tested full test_set | `source='immich_reverse_geocode'` |
+| Reverse-geocode (Overture Divisions, richer/county-level) | `sidecar/enrichment/overture_geocode.py` | Working, tested full test_set | `source='overture_divisions'`; chains off the first — only runs on photos still unresolved |
+| Object detection (YOLO-World) | `sidecar/enrichment/object_detect.py` + `gpu-ml/inference-service/tasks/object_detect.py` | Working, tested full test_set | 106-term open vocabulary, see `sidecar/config.py` |
+| Landmark matching (visual + proximity) | — | Designed, model chosen, not built | see "Landmark matching" section below |
 
-- **A — reuse Immich's own geocoder via its API.** Immich exposes
-  `GET /map/reverse-geocode?lat=&lon=`, which runs Immich's real matcher
-  (population-weighted, the same one that labels everything else). Call it for
-  any coords-without-city photo and store the result in the side-car. Avoids
-  reimplementing geocoding AND avoids the `lockedProperties` write-back fight,
-  since we store our own copy rather than pushing into Immich.
-- **B — nearest-neighbor against `geodata_places` in SQL.** Feasible at 227k
-  rows without PostGIS (a per-query math scan is cheap), but re-derives what
-  Immich already does, more crudely (raw distance ignores the population
-  weighting), and can disagree with Immich's own labels on the same coordinate.
-- **C — bounding-box region filter at query time.** Crude, box-shaped, but
-  needs no reference join. A pragmatic 80%, not a real fix.
+Supporting infrastructure built along the way:
 
-Leaning **A**: it's the cleanest, reuses the correct matcher, and fits the
-side-car (store `resolved_city/state/country` per UUID; the search agent's
-place resolution then also consults the side-car, not just `asset_exif.city`).
+- **`sidecar/` is a real Python package** (`sidecar/__init__.py`), with all
+  internal imports relative (`from . import config`, `from .. import db`).
+  Required after a real bug: a bare `import config`/`import db` inside
+  `sidecar/` silently resolved to `search-api`'s own `config.py`/`db.py`
+  instead, because of how the container's Python path was set up.
+- **`--scope test|full` on every enrichment entry point**, defaulting to
+  `test`. Running against the full library is always an explicit, deliberate
+  choice — never a silent default. `sidecar/test_set.py` +
+  `sidecar/populate_test_set.py` manage the pinned ~100-photo set + hand-picked
+  hard cases.
+- **`sidecar_dev` database is live**, migration applied, `county` column added
+  to `resolved_geo` after real Kentucky/Alaska test data showed "county but no
+  city" is a common, real, search-worthy case for rural/unincorporated areas —
+  not an edge case to drop.
+- **A generic, reusable GPU inference protocol on `gpu-ml`**
+  (`gpu-ml/inference-service/`): a task-registry pattern (`POST
+  /v1/infer/<task>`, `GET /v1/tasks`, `GET /health`) so new models register as
+  new tasks, not new services. Deliberately decoupled from Immich — callers
+  send raw image bytes, not asset IDs, so the service stays reusable across
+  projects. `object_detect` is the first registered task; audio-to-text
+  (see "Future enrichment candidates") is a strong second candidate for
+  proving this out further.
+- **`psycopg2.connect(**kwargs)`, never a DSN string**, everywhere in
+  `sidecar/`. The real Postgres password contains `%` and `!`, which broke a
+  plain DSN string (`postgresql://user:pass@host/db`) on first real
+  connection attempt. Keyword-argument connection avoids the whole class of
+  bug permanently.
+- **`::uuid[]` explicit casts** on every `= ANY(%s)` query against a
+  Python list of UUIDs — psycopg2's array adaptation doesn't reliably
+  produce a `uuid[]` array on its own, causing a live `uuid = text` type
+  error otherwise.
 
-## GPU-model candidates for producing augmentation data
+## OCR — resolved, no build needed (2026-08)
 
-Carried over from the "Local GPU for image labeling augmentation" chat. The
-organizing principle there: **batch vs. real-time.** Query-time work needs low
-latency (why the agent uses the Claude API, not a local LLM). Ingest-time
-enrichment has no deadline, so the slow-but-free GTX 1060 (6GB, shared with
-`immich-machine-learning` on the `gpu-ml` box) is well-suited — grind the
-backfill queue overnight, once per photo, forever.
+Original open question: is Immich's OCR text (added in Immich 2.2) queryable
+so the SQL agent could reach it? **Confirmed: yes, no sidecar work required.**
+OCR text is stored in a real, normal Postgres column —
+`asset_exif.ocrText` — filterable via plain string/full-text matching,
+already combined into Immich's own smart-search ranking alongside CLIP
+similarity (confirmed via Immich's architecture docs, and empirically: a
+"Scotland" search surfaced real OCR text matches *and* separately CLIP's own
+well-documented text-sensitivity/visual-pattern matches, both genuinely
+present, not one explaining the other).
 
-Priority order and findings:
+**Remaining task, not sidecar work:** confirm `asset_exif.ocrText` is included
+in `search-api/sql_tool.py`'s readable column allowlist so the SQL agent can
+actually query it. A `search-api` check, separate from anything in `sidecar/`.
 
-1. **Object detection — person counts + broader.** The strongest candidate: it
-   resolves the named "Kevin alone in frame" case CLIP can't, and generalizes
-   to vehicle/animal/object counts and compound queries ("dogs and no people").
-   - **YOLO-World** favored — open-vocabulary, prompt-driven classes, so it
-     matches how CLIP search already handles arbitrary text rather than being
-     locked to COCO's ~80 classes. Closed-vocabulary detectors (YOLO26-N/S,
-     RF-DETR) are faster/lighter but a step backward for open-ended queries;
-     fine only if common categories suffice.
-   - Stored as e.g. `person_count`, plus detected-class counts, per UUID.
-2. **OCR — already handled by Immich, do NOT rebuild.** Immich 2.2 added
-   built-in OCR (auto on new uploads; English, Simplified/Traditional Chinese,
-   Japanese), indexed in Immich's own search. Building our own would be a
-   redundant second GPU pass. **Open research task, not a build:** check whether
-   Immich's OCR text is queryable via Postgres/API so the SQL agent tool can
-   reach it — if not, surfacing it (or copying it into the side-car) is the only
-   OCR work worth doing. Also confirm the deployed Immich version actually
-   includes 2.2.
-3. **Landmark model — DELF/DELG as a second embedding source.** Google's
-   open-sourced landmark retrieval model (attentive local descriptors;
-   embedding + nearest-neighbor, same shape as the current `match.py`).
-   - Caveat: DELF/DELG covers ~30k famous global landmarks (Eiffel-tier). It
-     does NOT help the actual bottleneck — vernacular family landmarks (WDW
-     attractions, local restaurants), for which the hand-labeled CLIP-embedding
-     approach is already correct. So DELF/DELG is a *layered second source* for
-     famous landmarks, not a replacement for the curated set.
-4. **Dense captioning (BLIP-2 / moondream / small LLaVA) — lowest priority.**
-   Generates a per-photo text description to store and full-text-search or feed
-   the SQL tool as another column. Most GPU-hungry of the four, and CLIP already
-   covers scene search reasonably — probably not worth the batch time unless a
-   concrete need appears.
+## Landmark matching — dual-source design (2026-08)
 
-VRAM note: the 1060 has 6GB shared with Immich's ML, which spikes during
-embedding backfills. Any batch model must fit alongside that or be scheduled to
-avoid overlap (same contention caveat as the retired Ollama service). This is a
-real constraint on model choice and concurrency.
+Two genuinely complementary sources, not primary+fallback — a future search
+query should consult both, not prefer one:
 
-## Process & infrastructure decisions (2026-07-17)
+1. **Visual recognition** — an ML model looking at the photo itself. Catches
+   a landmark that dominates the frame even when the photo has no useful
+   GPS data nearby (e.g. one photo from a trip where most others weren't
+   geotagged).
+2. **Geospatial proximity** — nearby named points of interest from map data,
+   regardless of what's actually visible in the frame. Catches:
+   - Photos taken *near* a landmark where the landmark itself isn't in frame
+     at all (standing at its base, camera pointed at your kids).
+   - **Lesser-known landmarks a visual model was never trained/prompted on**
+     — proximity has no vocabulary ceiling the way a visual model does.
+   - **Tightly-cropped photos** where part of a landmark is technically
+     visible but there's too little context for a visual model to recognize
+     it confidently.
 
-Settled ahead of schema/pipeline work, before the newly-added photo backlog
-finishes indexing:
+   These last two are broader value than originally framed (not just "the
+   landmark is literally absent from the photo") — worth stating explicitly
+   since it changes how a future agent query should treat the two sources:
+   query both and union/rank, don't treat proximity as merely a fallback.
+
+**Proximity component — reuses proven infrastructure.** Structurally the same
+shape as `overture_geocode.py`, against Overture's separate **Places theme**
+(points of interest with coordinates/categories/names), not the Divisions
+theme already used for geocoding. Same batch/`enrichment_status`/idempotency
+pattern. Before writing real code: spike the Places theme schema the same
+way `spike_overture_schema.py` did for Divisions — the last two real bugs in
+this project both came from unverified table/column-name assumptions, worth
+continuing that discipline rather than guessing.
+
+**Visual component — model chosen (2026-08): DINOv3 (Meta), not DELF/DELG.**
+Research findings:
+- DELF/DELG is an older (2017-2020) Google/TensorFlow release. Current
+  academic SOTA for this exact task (CVNet, AMES, reranking transformers)
+  pushes benchmark scores further but adds real engineering complexity —
+  sparse local-descriptor extraction, cross-image reranking pipelines — that
+  makes sense at "millions of product images" scale, not a personal photo
+  library's landmark set.
+- **DINOv3** (Meta, Aug 2025) is directly benchmarked on this task via plain
+  non-parametric retrieval (embed a query image, rank a reference set by
+  cosine similarity) against the standard Oxford/Paris landmark-retrieval
+  benchmarks, and "achieves the strongest performance by large margins" over
+  DINOv2 and other baselines — and DINOv2 itself already significantly
+  outperforms older baselines on the same benchmarks. PyTorch-native, no
+  TensorFlow dependency, standard HuggingFace/PyTorch install — fits the
+  `inference-service` task registry cleanly, same pattern as
+  `object_detect.py`.
+- **This is architecturally the SAME pattern already in
+  `search-api/landmark/match.py`** (embed + nearest-neighbor against a
+  curated reference set, currently using CLIP embeddings for vernacular
+  family landmarks) — DINOv3 slots in as a stronger backbone for the same
+  architecture, not a new system to learn or maintain.
+- **DINOv2 is the fallback** if DINOv3's licensing/self-hosted availability
+  turns out to be awkward — UNVERIFIED, not yet checked; DINOv2 is more
+  battle-tested and still clearly outperforms pre-2023 approaches.
+
+**Real open question before building, not yet answered:** where does the
+reference embedding set for "famous landmarks" come from? Google Landmarks
+Dataset v2 (5M images, 200k labels, Wikimedia Commons-sourced) is the
+standard academic source, but is almost certainly overkill for what would
+realistically appear in a family library — a curated few hundred/thousand
+iconic landmarks is probably the right scope. Decide deliberately before
+building; don't default to "grab the biggest available dataset."
+
+**Schema gap this surfaces:** `landmark_matches` (see
+`migrations/001_initial_schema.sql`) has no `source` column — it was
+designed before two genuinely different provenances (visual vs. proximity)
+were on the table. Needs adding, same reasoning as `resolved_geo.county`.
+
+## Schema evolution tooling (2026-08)
+
+Manually typing `ALTER TABLE ... ADD COLUMN` into `psql` by hand each time a
+schema needs to evolve (as happened for `resolved_geo.county`) doesn't scale
+and isn't portable — a real gap flagged directly. Postgres already makes the
+idempotent version easy (`ADD COLUMN IF NOT EXISTS`, `CREATE TABLE IF NOT
+EXISTS`); the fix is just wrapping these in small reusable helpers in
+`sidecar/db.py` (`ensure_column(table, column, coltype_sql)`,
+`ensure_table(name, create_sql)`) that any enrichment module can call before
+running. `migrations/001_initial_schema.sql` stays the source of truth for a
+*fresh* database; ongoing evolution becomes self-healing instead of a manual
+step to remember. **Not yet built** — first real use will be adding
+`landmark_matches.source`.
+
+## Future enrichment candidates (2026-08)
+
+Two accepted for the roadmap (not yet built — after the current landmark-matching
+work, which is next):
+
+- **Audio-to-text for videos** — model chosen: **`faster-whisper`** (an
+  optimized reimplementation of OpenAI's Whisper, ~4x faster with lower
+  memory than vanilla Whisper, MIT-licensed, fully self-hosted, no ongoing
+  API cost). Considered and rejected: NVIDIA Canary/Parakeet (better on some
+  benchmarks, but pull in the heavier NeMo toolkit for no clear payoff at
+  this scale) and managed APIs (Deepgram, AssemblyAI, Groq-hosted Whisper —
+  all send data externally and cost per-minute, inconsistent with this
+  project's self-hosted ethos). Batch/offline fits this project's existing
+  "no deadline, run overnight" pattern — no need for the streaming/real-time
+  capability those alternatives compete on. Strong fit for the
+  `inference-service` task-registry pattern (a new task, same protocol) —
+  good candidate to prove the registry's reusability beyond `object_detect`.
+- **Scene/relationship captioning** — model chosen: **Florence-2**
+  (Microsoft, MIT license). Fills a real, distinct gap: `object_counts`
+  (YOLO-World) answers *what* is in a photo and *how many*, but not
+  relationships, actions, or context ("kids building a sandcastle" vs. a
+  disconnected `person`/`sand`/`bucket` list) — something CLIP's holistic
+  embedding also doesn't reliably surface.
+  - **Explicitly does NOT replace YOLO-World** — researched and confirmed
+    2026-08: the two excel at genuinely different things. YOLO-World is a
+    dedicated, purpose-built detector optimized for fast, efficient
+    per-class counting across a batch (its whole existing job); Florence-2
+    is a general multi-task VLM whose real strength is language generation.
+    An independent comparison of these exact models for production
+    deployment states it directly: "YOLO-World's speed... Florence-2's
+    language generation" — different strengths, not competing for the same
+    one. For this project's actual workload (batch-processing potentially
+    thousands of photos overnight on a shared 6GB GPU), a lighter
+    purpose-built detector doing one pass per image is also the better
+    throughput fit than a heavier general VLM doing double duty.
+  - Same complementary-sources pattern as landmark matching (visual +
+    proximity) — multiple distinct enrichments each contributing a
+    different kind of fact, not one enrichment superseding another.
+  - Minor, non-blocking note: YOLO-World inherits Ultralytics' GPL-3.0
+    license (mainly a concern for redistributing a proprietary product, not
+    for this self-hosted personal tool); Florence-2 is MIT.
+- *(Add more here as they come up, rather than letting them live only in
+  chat history.)*
+
+## GPU/VRAM constraint (still holds)
+
+The gpu-ml box's GTX 1060 has 6GB VRAM shared across `immich-machine-learning`,
+`ollama`, and now `inference-service`. Confirmed working for `object_detect`
+(YOLO-World small variant, single worker, lazy model loading) — see
+`gpu-ml/README.md`'s VRAM contention note. Any new task (visual landmark
+model, audio-to-text) needs to fit within this same shared budget or be
+scheduled to avoid overlap; not yet stress-tested under simultaneous load
+from multiple services.
+
+## Process & infrastructure decisions (2026-07, still holding)
 
 - **Two containers.** `search-api` (prod) stays completely sidecar-blind —
-  no dependency on the sidecar code or DB. A separate `search-api-dev`
-  container (same image/codebase, different config) is where sidecar
-  integration is built and tested. Prod is never at risk from in-progress
-  sidecar work.
+  no dependency on the sidecar code or DB. `search-api-dev` (same
+  image/codebase, different config + a superset build via
+  `sidecar/Dockerfile.dev`) is where sidecar integration is built and tested.
 - **Sidecar databases: separate Postgres databases, both dev and prod, on
-  the same Postgres instance as Immich's own DB** (not a schema inside
-  Immich's database — rejected due to coupling to Immich's migration/restore
-  lifecycle).
-  - **Dev (`sidecar_dev`):** no backup. Wipe-and-redevelop freely
-    (`DROP DATABASE` + re-run migrations) — disposability is the point.
-  - **Prod (`sidecar_prod`, built later):** will need its own backup
-    mechanism, since it won't ride along in Immich's existing backup job the
-    way a same-database schema would have. Flagged as a real task for the
-    prod-migration step, not solved yet.
-- **Repo layout.** `sidecar/` is a top-level folder, sibling to `search-api/`
-  (mirrors how `gpu-ml` got its own repo for the same separation-of-concerns
-  reason), not nested inside `search-api/`.
-- **Schema shape.** Per-tool typed tables (`resolved_geo`, `object_counts`,
-  `landmark_matches`, ...) rather than a generic EAV key/value table — chosen
-  for SQL-agent reliability: typed columns are far easier for LLM-generated
-  SQL to query correctly than a self-joined `key`/`value` table. A separate
-  `enrichment_status(asset_id, tool, model_version, status)` table is written
-  unconditionally on every enrichment run, so "zero facts produced" (a valid
-  result, e.g. zero detected objects) is distinguishable from "never
-  processed" — and also drives the "what needs enrichment" query.
-- **UUID stability caveat.** Immich UUIDs are not move-proof: moving a file,
-  even within one external library, causes Immich to treat it as a new asset
-  on rescan (known Immich issue), and moving across external libraries
-  produces a duplicate with the old entry marked offline. Policy: don't try
-  to track this — reaugment under the new UUID when it appears (enrichment is
-  idempotent and cheap on the overnight GPU batch). Dead/offline duplicate
-  entries are cleaned up via Immich's own **"Remove offline files"** job
-  (admin Jobs page), run periodically — no custom reconciliation script
-  needed.
-- **Dev test set.** A fixed, pinned ~100-photo sample plus a handful of
-  hand-picked hard cases (e.g. the 4 Disney no-city photos, a known
-  multi-face photo), stored in `sidecar.test_set` with a `label` column
-  distinguishing `'random'` fill from `'hard_case:...'` entries. Chosen over
-  a fresh-random-sample-per-run so approach/model changes are comparable
-  over time.
+  the same Postgres instance as Immich's own DB.**
+  - **Dev (`sidecar_dev`):** no backup. Wipe-and-redevelop freely — live now,
+    populated with real test data.
+  - **Prod (`sidecar_prod`, not yet built):** will need its own backup
+    mechanism.
+- **Repo layout.** `sidecar/` is a top-level folder, sibling to `search-api/`.
+  `gpu-ml` is its own separate repo, one device serving multiple projects.
+- **Schema shape.** Per-tool typed tables, not EAV — proven correct in
+  practice across three real enrichment tools now.
+- **UUID stability caveat.** Immich UUIDs are not move-proof. Policy:
+  reaugment under the new UUID when it appears; dead duplicates cleaned up
+  via Immich's own "Remove offline files" job.
+- **Dev test set.** Fixed, pinned ~100-photo sample + hand-picked hard cases
+  in `sidecar.test_set` — live now, includes the original 5 geocode hard
+  cases (2 resolved, 3 correctly-null-in-wilderness) plus a multi-face photo.
 
-## First steps for the new chat
+## Next steps (agreed order, 2026-08)
 
-1. **Measure the real gap.** On the real (non-sample) library, how many photos
-   have coordinates but no city? That sizes whether reverse-geocode enrichment
-   (option A) is worth building now. Also: `count(*)` of photos total, to gauge
-   overnight batch feasibility. *(Blocked on the newly-added backlog finishing
-   indexing as of 2026-07-17.)*
-2. **Design the side-car schema.** ~~UUID-keyed, open-ended for many
-   fact-types, insulated from Immich's schema. Decide per-tool tables vs.
-   typed key/value. Decide where it lives.~~ **Done** — see "Process &
-   infrastructure decisions" above; DDL exists in
-   `sidecar/migrations/001_initial_schema.sql`.
-3. **Design the ingest/enrichment pipeline.** How new photos (and manual edits)
-   get picked up, queued, processed on the `gpu-ml` box, and written to the
-   side-car. Batch, idempotent, resumable — mirror the lessons from the search
-   work (graceful degradation, structured logging, verify-before-trust).
-4. **Wire the side-car into the search agent.** Extend `run_readonly_sql`'s
-   readable allowlist (or add structured filters) so augmentation facts are
-   queryable. Re-run the relevant parts of the manual test batch.
-5. **Pick the first enrichment to build** — reverse-geocode (A) and/or object
-   detection (person counts), the two with the clearest, already-motivated
-   payoff. *(Leaning reverse-geocode first: smallest, lowest GPU cost, proves
-   the pipeline end-to-end regardless of library size.)*
+1. ~~Update this design doc~~ **Done.**
+2. ~~Research current visual-landmark-recognition options~~ **Done — DINOv3
+   chosen** (see "Landmark matching" above).
+3. **Build schema evolution tooling** (`ensure_column`/`ensure_table` in
+   `sidecar/db.py`).
+4. **Add `landmark_matches.source`** using the new tooling — first real
+   dogfood use of it.
+5. **Spike Overture's Places theme schema** (mirrors
+   `spike_overture_schema.py`'s approach for Divisions) — don't guess column
+   names given the project's track record on this.
+6. **Build `overture_landmarks.py`** (proximity matching) — reuses proven
+   `overture_geocode.py`-shaped infrastructure.
+7. **Build the visual landmark-matching task** (DINOv3) — including deciding
+   the reference-landmark-set source (see open question above).
+8. **Wire the side-car into the search agent** — still not started. Extend
+   `run_readonly_sql`'s readable allowlist (or add structured filters) so
+   `resolved_geo`/`object_counts`/`landmark_matches` are queryable. This was
+   explicitly deferred until the enrichment tools themselves were proven —
+   that's now true for two of three planned tables.
+9. **Run the full-library pass** (`--scope full`) for whichever enrichments
+   are trusted — deferred until after the search agent can actually use the
+   data, so there's a real payoff to point at before spending the batch time.
 
 ## Pointers into existing code/docs
 
 - Main `photo-search/README.md` — full project snapshot, the search-agent design.
 - `search-api/sql_tool.py` — the read-only SQL tool + dedicated Postgres role;
-  the model for how the agent would query the side-car safely.
+  the model for how the agent will query the side-car once wired in.
 - `search-api/tools.py` — `search_photos` filters (people/cities match modes);
   where structured augmentation filters could be added.
-- `gpu-ml` repo — the shared GPU box; where batch enrichment services would run
-  alongside `immich-machine-learning` (Ollama there is now retired/dead-ended).
-- `search-api/landmark/` — the existing curated CLIP-embedding landmark matcher
-  that DELF/DELG would layer onto, not replace.
-- `sidecar/` — the side-car codebase itself (migrations, `db.py`, `config.py`,
-  `test_set.py`, `enrichment/`), sibling to `search-api/`.
+- `search-api/landmark/` — the existing curated CLIP-embedding landmark
+  matcher that a visual landmark-matching task would layer onto, not replace.
+- `gpu-ml/` — the shared GPU device (own repo). `gpu-ml/inference-service/` —
+  the generic task-registry inference protocol; `tasks/object_detect.py` is
+  the reference implementation for adding a new task (e.g. visual landmark
+  matching via DINOv3, audio-to-text).
+- `sidecar/` — the side-car codebase: `migrations/`, `db.py`, `config.py`,
+  `test_set.py`, `populate_test_set.py`, `enrichment/` (`reverse_geocode.py`,
+  `overture_geocode.py`, `object_detect.py`), `run_*.py` entry points,
+  `spike_overture_schema.py` (schema-verification pattern to reuse for
+  Overture's Places theme).
