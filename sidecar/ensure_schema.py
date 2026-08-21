@@ -29,6 +29,14 @@ def run():
     db.ensure_column("landmark_matches", "source", "text")
     logger.info("ensured: landmark_matches.source")
 
+    # landmark_matches.distance_meters: added 2026-08, second real dogfood
+    # use of this tooling. Needed by overture_landmarks.py (proximity
+    # matching) -- a 50m match and an 800m match mean very different things
+    # for relevance, and this wasn't in the original schema since the
+    # proximity source didn't exist yet when the table was designed.
+    db.ensure_column("landmark_matches", "distance_meters", "double precision")
+    logger.info("ensured: landmark_matches.distance_meters")
+
     # Add future schema evolutions here, e.g.:
     # db.ensure_column("resolved_geo", "some_new_field", "text")
 
