@@ -29,8 +29,17 @@ separately below, not silently merged into the confirmed list, so it's
 honest about what's actually been verified. Add to either list as new
 photo locations surface more real category values worth checking.
 
+KNOWN ISSUE, confirmed 2026-08 against real test-set data (not just the
+Disney spike): 'landmark_and_historical_building' is noisier than expected
+-- Overture applies it to many ordinary named apartment/condo buildings,
+not just genuine tourist landmarks (the original spike's "Windermere Cay
+Apartments" false positive turned out to be the general pattern, not an
+isolated case). Not yet resolved -- flagged for a follow-up decision, not
+silently ignored.
+
 CATEGORY_FILTER_VERSION is part of MODEL_VERSION specifically so refining
-this list (e.g. adding zoo/lighthouse after verifying them) is a tracked
+this list (e.g. adding zoo/lighthouse after verifying them, or tightening
+the noisy landmark_and_historical_building case above) is a tracked
 version bump, not a silent behavior change under the same model_version --
 same reasoning as OBJECT_DETECT_VOCABULARY_VERSION.
 """
@@ -57,7 +66,9 @@ CATEGORY_FILTER_VERSION = "landmark-categories-v1"
 MODEL_VERSION = f"overture-places:{RELEASE}:{CATEGORY_FILTER_VERSION}"
 
 # CONFIRMED against real data (see module docstring) -- checked first via
-# taxonomy.primary.
+# taxonomy.primary. NOTE: landmark_and_historical_building is confirmed
+# real but also confirmed NOISY (see module docstring "KNOWN ISSUE") --
+# kept for now pending a decision on how to refine it.
 LANDMARK_TAXONOMY_VALUES = {
     "amusement_park", "amusement_attraction", "museum", "castle", "mountain",
     "island", "public_fountain", "historic_site",
@@ -176,6 +187,17 @@ def find_nearby_landmarks(con, lat, lon):
     # restriction), and QUALIFY is for window functions, not a plain
     # computed column, so a CTE is the correct tool here, not either of
     # those.
+    #
+    # Every interpolated coordinate value is explicitly cast to DOUBLE.
+    # Without this, DuckDB infers a fixed-precision DECIMAL type from each
+    # literal's exact digit count -- and depending on how many decimal
+    # places a given lon_margin happens to compute to (varies by
+    # latitude), the inferred precision sometimes has no room left for a
+    # 2-3 digit longitude, overflowing. Confirmed via a live failure
+    # 2026-08: "-84.885556" and "-122.087738" both overflowed a
+    # DuckDB-inferred DECIMAL(18,17), while other coordinates in the same
+    # run happened not to. Casting to DOUBLE sidesteps decimal-literal
+    # inference entirely rather than trying to predict when it misfires.
     query = f"""
         WITH candidates AS (
             SELECT
@@ -184,13 +206,15 @@ def find_nearby_landmarks(con, lat, lon):
                 taxonomy.primary AS taxonomy_primary,
                 basic_category,
                 2 * {EARTH_RADIUS_METERS} * asin(sqrt(
-                    pow(sin(radians(ST_Y(ST_Centroid(geometry)) - {lat}) / 2), 2) +
-                    cos(radians({lat})) * cos(radians(ST_Y(ST_Centroid(geometry)))) *
-                    pow(sin(radians(ST_X(ST_Centroid(geometry)) - {lon}) / 2), 2)
+                    pow(sin(radians(ST_Y(ST_Centroid(geometry)) - {lat}::DOUBLE) / 2), 2) +
+                    cos(radians({lat}::DOUBLE)) * cos(radians(ST_Y(ST_Centroid(geometry)))) *
+                    pow(sin(radians(ST_X(ST_Centroid(geometry)) - {lon}::DOUBLE) / 2), 2)
                 )) AS distance_meters
             FROM read_parquet('{PLACES_PATH}', hive_partitioning=1)
-            WHERE bbox.xmin <= {lon} + {lon_margin} AND bbox.xmax >= {lon} - {lon_margin}
-              AND bbox.ymin <= {lat} + {lat_margin} AND bbox.ymax >= {lat} - {lat_margin}
+            WHERE bbox.xmin <= {lon}::DOUBLE + {lon_margin}::DOUBLE
+              AND bbox.xmax >= {lon}::DOUBLE - {lon_margin}::DOUBLE
+              AND bbox.ymin <= {lat}::DOUBLE + {lat_margin}::DOUBLE
+              AND bbox.ymax >= {lat}::DOUBLE - {lat_margin}::DOUBLE
               AND confidence >= {MIN_CONFIDENCE}
         )
         SELECT name, confidence, taxonomy_primary, basic_category, distance_meters
