@@ -34,8 +34,16 @@ Disney spike): 'landmark_and_historical_building' is noisier than expected
 -- Overture applies it to many ordinary named apartment/condo buildings,
 not just genuine tourist landmarks (the original spike's "Windermere Cay
 Apartments" false positive turned out to be the general pattern, not an
-isolated case). Not yet resolved -- flagged for a follow-up decision, not
-silently ignored.
+isolated case). PARTIALLY addressed 2026-08 via RESIDENTIAL_NAME_KEYWORDS
+below -- a name-substring exclusion, not a structural fix. Checked against
+the actual noise from a real test run: most of it (e.g. "800 Apartments",
+"Dosker Manor", "Lofts of Broadway", "Jackson Tower Condominiums") contains
+an unambiguous residential-real-estate term and gets caught. Some does NOT
+(e.g. "Vue at 3rd", "WG Louisville", "Madrid Building") and slips through
+regardless -- this is a heuristic, not a complete fix. Kept intentionally
+narrow (apartments/condos/lofts/flats/manor/townhomes/residences only) to
+avoid excluding genuine landmarks that happen to contain broader,
+ambiguous words like "tower" or "square" (Eiffel Tower, Times Square).
 
 CATEGORY_FILTER_VERSION is part of MODEL_VERSION specifically so refining
 this list (e.g. adding zoo/lighthouse after verifying them, or tightening
@@ -62,13 +70,13 @@ TOOL = "overture_landmarks"
 RELEASE = "2026-07-22.0"
 PLACES_PATH = f"s3://overturemaps-us-west-2/release/{RELEASE}/theme=places/type=place/*"
 
-CATEGORY_FILTER_VERSION = "landmark-categories-v1"
+CATEGORY_FILTER_VERSION = "landmark-categories-v2"
 MODEL_VERSION = f"overture-places:{RELEASE}:{CATEGORY_FILTER_VERSION}"
 
 # CONFIRMED against real data (see module docstring) -- checked first via
 # taxonomy.primary. NOTE: landmark_and_historical_building is confirmed
 # real but also confirmed NOISY (see module docstring "KNOWN ISSUE") --
-# kept for now pending a decision on how to refine it.
+# partially mitigated by RESIDENTIAL_NAME_KEYWORDS below, not fully fixed.
 LANDMARK_TAXONOMY_VALUES = {
     "amusement_park", "amusement_attraction", "museum", "castle", "mountain",
     "island", "public_fountain", "historic_site",
@@ -82,6 +90,16 @@ LANDMARK_TAXONOMY_VALUES = {
 LANDMARK_BASIC_CATEGORY_FALLBACK = {
     "zoo", "lighthouse", "monument", "cathedral", "aquarium", "stadium",
     "national_park", "historical_landmark",
+}
+
+# Name-substring exclusion for the landmark_and_historical_building noise
+# problem (see module docstring "KNOWN ISSUE"). Deliberately narrow --
+# unambiguous residential-real-estate terms only. Checked case-insensitively
+# as a substring anywhere in the name.
+RESIDENTIAL_NAME_KEYWORDS = {
+    "apartment", "apartments", "condominium", "condominiums", "condo", "condos",
+    "loft", "lofts", "flat", "flats", "manor", "townhome", "townhomes",
+    "residence", "residences",
 }
 
 # Overture's own existence-confidence score threshold -- their docs
@@ -154,9 +172,19 @@ def find_unresolved(scope="test"):
     return [(aid, lat, lon) for (aid, lat, lon) in all_candidates if aid not in already_done]
 
 
-def _is_landmark(taxonomy_primary, basic_category):
+def _looks_residential(name):
+    """Case-insensitive substring check against RESIDENTIAL_NAME_KEYWORDS.
+    A heuristic, not a guarantee -- see module docstring "KNOWN ISSUE"."""
+    name_lower = name.lower()
+    return any(keyword in name_lower for keyword in RESIDENTIAL_NAME_KEYWORDS)
+
+
+def _is_landmark(name, taxonomy_primary, basic_category):
     """taxonomy.primary checked first (more reliable, per module docstring);
-    basic_category only as a secondary fallback signal."""
+    basic_category only as a secondary fallback signal. Either match is then
+    rejected if the name looks residential (see _looks_residential)."""
+    if _looks_residential(name):
+        return False
     if taxonomy_primary in LANDMARK_TAXONOMY_VALUES:
         return True
     if basic_category in LANDMARK_BASIC_CATEGORY_FALLBACK:
@@ -226,7 +254,7 @@ def find_nearby_landmarks(con, lat, lon):
 
     matches = []
     for name, confidence, taxonomy_primary, basic_category, distance_meters in rows:
-        if name and _is_landmark(taxonomy_primary, basic_category):
+        if name and _is_landmark(name, taxonomy_primary, basic_category):
             matches.append({
                 "name": name,
                 "confidence": confidence,
