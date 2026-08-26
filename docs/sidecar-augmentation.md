@@ -1,13 +1,16 @@
 # Photo Metadata Augmentation — Side-car Database (design note)
 
-**Status (2026-08):** core infrastructure built and proven on the dev test
-set. Three enrichment tools working end-to-end: reverse-geocoding (two
-sources), object detection, and a generic reusable GPU inference protocol.
-Landmark matching (dual-source: visual + geospatial proximity) is designed,
-with the visual model now chosen (DINOv3 — see below), but not yet built —
-next up. This note is the living record of what's built, why, and what's
-next; update it as things change rather than letting chat history be the
-only record.
+**Status (2026-08, latest):** four enrichment tools built and proven on the
+dev test set (reverse-geocode x2, object detection, landmark proximity).
+The DINOv3 visual-landmark-matching pipeline is deep in progress: model
+access granted, full reference dataset downloaded AND embedded (1.58M
+images), generic embedding endpoint built and tested on gpu-ml. The one
+remaining piece — the actual matching endpoint — is blocked on one open
+infrastructure decision (see "Landmark matching — DINOv3 implementation
+progress" below) that needs to be resolved at the start of the next
+session before writing more code. This note is the living record of
+what's built, why, and what's next; update it as things change rather
+than letting chat history be the only record.
 
 ---
 
@@ -54,7 +57,7 @@ stored somewhere the search agent can query.** That store is the side-car.
   so the agent gains real structured facts instead of inferring frame contents
   indirectly. **Not yet done** — see "Next steps."
 
-## Implementation status (2026-08)
+## Implementation status (2026-08, latest)
 
 What's actually built and proven, mapped to real files:
 
@@ -63,7 +66,8 @@ What's actually built and proven, mapped to real files:
 | Reverse-geocode (Immich's own geocoder) | `sidecar/enrichment/reverse_geocode.py` | Working, tested full test_set | `source='immich_reverse_geocode'` |
 | Reverse-geocode (Overture Divisions, richer/county-level) | `sidecar/enrichment/overture_geocode.py` | Working, tested full test_set | `source='overture_divisions'`; chains off the first — only runs on photos still unresolved |
 | Object detection (YOLO-World) | `sidecar/enrichment/object_detect.py` + `gpu-ml/inference-service/tasks/object_detect.py` | Working, tested full test_set | 106-term open vocabulary, see `sidecar/config.py` |
-| Landmark matching (visual + proximity) | — | Designed, model chosen, not built | see "Landmark matching" section below |
+| Landmark matching, proximity (Overture Places) | `sidecar/enrichment/overture_landmarks.py` | Working, tested full test_set (v2 category filter) | `source='overture_places'`; residential-building noise partially filtered — see design doc history for the `landmark_and_historical_building` taxonomy caveat |
+| Landmark matching, visual (DINOv3) | `sidecar/enrichment/dinov3_landmarks.py` | **NOT YET BUILT** — see detailed status below | Generic embedding piece done; matching + sidecar client remain |
 
 Supporting infrastructure built along the way:
 
@@ -78,17 +82,22 @@ Supporting infrastructure built along the way:
   `sidecar/populate_test_set.py` manage the pinned ~100-photo set + hand-picked
   hard cases.
 - **`sidecar_dev` database is live**, migration applied, `county` column added
-  to `resolved_geo` after real Kentucky/Alaska test data showed "county but no
-  city" is a common, real, search-worthy case for rural/unincorporated areas —
-  not an edge case to drop.
+  to `resolved_geo`, `source` + `distance_meters` columns added to
+  `landmark_matches` (via the new schema-evolution tooling, see below).
+- **`sidecar/db.py` has `ensure_column()`/`ensure_table()`** (idempotent
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS`
+  wrappers) and **`sidecar/ensure_schema.py`** declares actual schema
+  evolutions to apply — run via `python -m sidecar.ensure_schema`. Fixes the
+  "typing ALTER TABLE into psql by hand" gap. Add new evolutions there as the
+  schema grows.
 - **A generic, reusable GPU inference protocol on `gpu-ml`**
   (`gpu-ml/inference-service/`): a task-registry pattern (`POST
   /v1/infer/<task>`, `GET /v1/tasks`, `GET /health`) so new models register as
   new tasks, not new services. Deliberately decoupled from Immich — callers
   send raw image bytes, not asset IDs, so the service stays reusable across
-  projects. `object_detect` is the first registered task; audio-to-text
-  (see "Future enrichment candidates") is a strong second candidate for
-  proving this out further.
+  projects. Registered tasks: `object_detect` (YOLO-World), `embed_image`
+  (DINOv3, generic — see below). Audio-to-text (`faster-whisper`) and scene
+  captioning (Florence-2) are accepted future candidates, not yet built.
 - **`psycopg2.connect(**kwargs)`, never a DSN string**, everywhere in
   `sidecar/`. The real Postgres password contains `%` and `!`, which broke a
   plain DSN string (`postgresql://user:pass@host/db`) on first real
@@ -98,6 +107,12 @@ Supporting infrastructure built along the way:
   Python list of UUIDs — psycopg2's array adaptation doesn't reliably
   produce a `uuid[]` array on its own, causing a live `uuid = text` type
   error otherwise.
+- **DuckDB queries against Python-interpolated float literals need explicit
+  `::DOUBLE` casts** — DuckDB infers a fixed-precision DECIMAL type from a
+  literal's exact digit count otherwise, which can overflow unpredictably
+  depending on how many decimal places a computed value (e.g. a
+  latitude-adjusted bbox margin) happens to have. Broke both `overture_geocode.py`
+  and `overture_landmarks.py` before the explicit-cast fix.
 
 ## OCR — resolved, no build needed (2026-08)
 
@@ -115,96 +130,162 @@ present, not one explaining the other).
 in `search-api/sql_tool.py`'s readable column allowlist so the SQL agent can
 actually query it. A `search-api` check, separate from anything in `sidecar/`.
 
-## Landmark matching — dual-source design (2026-08)
+## Landmark matching — proximity component (DONE, 2026-08)
 
-Two genuinely complementary sources, not primary+fallback — a future search
-query should consult both, not prefer one:
+`sidecar/enrichment/overture_landmarks.py`, built and proven against the
+full test set. Queries Overture's **Places** theme (not Divisions, which
+`overture_geocode.py` uses), bbox-prefiltered + exact Haversine distance
+within `MAX_DISTANCE_METERS` (500m, unvalidated starting guess).
 
-1. **Visual recognition** — an ML model looking at the photo itself. Catches
-   a landmark that dominates the frame even when the photo has no useful
-   GPS data nearby (e.g. one photo from a trip where most others weren't
-   geotagged).
-2. **Geospatial proximity** — nearby named points of interest from map data,
-   regardless of what's actually visible in the frame. Catches:
-   - Photos taken *near* a landmark where the landmark itself isn't in frame
-     at all (standing at its base, camera pointed at your kids).
-   - **Lesser-known landmarks a visual model was never trained/prompted on**
-     — proximity has no vocabulary ceiling the way a visual model does.
-   - **Tightly-cropped photos** where part of a landmark is technically
-     visible but there's too little context for a visual model to recognize
-     it confidently.
+**Category filtering** (which Places rows count as "landmarks"):
+`taxonomy.primary` checked first (Overture's own docs describe `taxonomy` as
+the fix for the older `basic_category` field's inconsistencies —
+`basic_category` used only as a secondary fallback). CONFIRMED-real
+taxonomy values (from live Disney-area data): `amusement_park`,
+`amusement_attraction`, `museum`, `castle`, `mountain`, `island`,
+`public_fountain`, `historic_site`, `landmark_and_historical_building`,
+`marina`, `beach`.
 
-   These last two are broader value than originally framed (not just "the
-   landmark is literally absent from the photo") — worth stating explicitly
-   since it changes how a future agent query should treat the two sources:
-   query both and union/rank, don't treat proximity as merely a fallback.
+**Known noise issue, partially fixed:** `landmark_and_historical_building`
+turned out to match many ordinary named apartment/condo buildings, not just
+real landmarks. `RESIDENTIAL_NAME_KEYWORDS` (a name-substring exclusion —
+apartments/condos/lofts/flats/manor/townhomes/residences) catches most of
+this real-data noise but not all of it (`Vue at 3rd`, `Madrid Building`
+still slip through) — a heuristic, not a structural fix.
+`CATEGORY_FILTER_VERSION = "landmark-categories-v2"` tracks this state;
+bump it if the filter is refined further.
 
-**Proximity component — reuses proven infrastructure.** Structurally the same
-shape as `overture_geocode.py`, against Overture's separate **Places theme**
-(points of interest with coordinates/categories/names), not the Divisions
-theme already used for geocoding. Same batch/`enrichment_status`/idempotency
-pattern. Before writing real code: spike the Places theme schema the same
-way `spike_overture_schema.py` did for Divisions — the last two real bugs in
-this project both came from unverified table/column-name assumptions, worth
-continuing that discipline rather than guessing.
+**Also fixed:** `categories` (the old Overture Places property) is
+deprecated and due for removal in the release after the one this project
+pins (`2026-07-22.0`) — built against `taxonomy`/`basic_category` from the
+start, not the deprecated field.
 
-**Visual component — model chosen (2026-08): DINOv3 (Meta), not DELF/DELG.**
-Research findings:
-- DELF/DELG is an older (2017-2020) Google/TensorFlow release. Current
-  academic SOTA for this exact task (CVNet, AMES, reranking transformers)
-  pushes benchmark scores further but adds real engineering complexity —
-  sparse local-descriptor extraction, cross-image reranking pipelines — that
-  makes sense at "millions of product images" scale, not a personal photo
-  library's landmark set.
-- **DINOv3** (Meta, Aug 2025) is directly benchmarked on this task via plain
-  non-parametric retrieval (embed a query image, rank a reference set by
-  cosine similarity) against the standard Oxford/Paris landmark-retrieval
-  benchmarks, and "achieves the strongest performance by large margins" over
-  DINOv2 and other baselines — and DINOv2 itself already significantly
-  outperforms older baselines on the same benchmarks. PyTorch-native, no
-  TensorFlow dependency, standard HuggingFace/PyTorch install — fits the
-  `inference-service` task registry cleanly, same pattern as
-  `object_detect.py`.
-- **This is architecturally the SAME pattern already in
-  `search-api/landmark/match.py`** (embed + nearest-neighbor against a
-  curated reference set, currently using CLIP embeddings for vernacular
-  family landmarks) — DINOv3 slots in as a stronger backbone for the same
-  architecture, not a new system to learn or maintain.
-- **DINOv2 is the fallback** if DINOv3's licensing/self-hosted availability
-  turns out to be awkward — UNVERIFIED, not yet checked; DINOv2 is more
-  battle-tested and still clearly outperforms pre-2023 approaches.
+## Landmark matching — DINOv3 implementation progress (2026-08)
 
-**Real open question before building, not yet answered:** where does the
-reference embedding set for "famous landmarks" come from? Google Landmarks
-Dataset v2 (5M images, 200k labels, Wikimedia Commons-sourced) is the
-standard academic source, but is almost certainly overkill for what would
-realistically appear in a family library — a curated few hundred/thousand
-iconic landmarks is probably the right scope. Decide deliberately before
-building; don't default to "grab the biggest available dataset."
+**Design (still holding):** visual recognition (DINOv3) and geospatial
+proximity (`overture_landmarks.py`, done above) are genuinely complementary,
+not primary+fallback — catches landmarks a photo has no useful GPS for,
+lesser-known landmarks outside any fixed vocabulary, and tightly-cropped
+photos. A future search-agent query should consult both sources, not prefer
+one.
 
-**Schema gap this surfaces:** `landmark_matches` (see
-`migrations/001_initial_schema.sql`) has no `source` column — it was
-designed before two genuinely different provenances (visual vs. proximity)
-were on the table. Needs adding, same reasoning as `resolved_geo.county`.
+**Model: DINOv3 ViT-S+** (`facebook/dinov3-vits16plus-pretrain-lvd1689m`,
+~29M params) — chosen over DELF/DELG (older, TensorFlow) after live
+benchmark research; PyTorch-native, fits the `inference-service` task
+registry. **Gated model** — required a HuggingFace license application
+(approved this session, turnaround was about a day).
 
-## Schema evolution tooling (2026-08)
+**Reference dataset: GLDv2-clean, full set, no compromise on quality.**
+Explicitly chosen over a small hand-curated list after discussion — "as
+open and agnostic as possible" was the stated priority, and GLDv2-clean
+(the noise-filtered subset researchers actually use for this task, not the
+noisier raw 5M/200k-label full set) is the right *quality* choice too, not
+just a scope compromise. **1,580,470 images, 81,313 landmarks** — confirmed
+exact match against the dataset's own documented stats after both the
+download and the embedding run completed with zero discrepancy.
 
-Manually typing `ALTER TABLE ... ADD COLUMN` into `psql` by hand each time a
-schema needs to evolve (as happened for `resolved_geo.county`) doesn't scale
-and isn't portable — a real gap flagged directly. Postgres already makes the
-idempotent version easy (`ADD COLUMN IF NOT EXISTS`, `CREATE TABLE IF NOT
-EXISTS`); the fix is just wrapping these in small reusable helpers in
-`sidecar/db.py` (`ensure_column(table, column, coltype_sql)`,
-`ensure_table(name, create_sql)`) that any enrichment module can call before
-running. `migrations/001_initial_schema.sql` stays the source of truth for a
-*fresh* database; ongoing evolution becomes self-healing instead of a manual
-step to remember. **Not yet built** — first real use will be adding
-`landmark_matches.source`.
+**What's actually built and working, in order:**
+
+1. ✅ **`gpu-ml/landmark-reference/download_gldv2_clean.py`** — downloads
+   GLDv2's raw `train` shards (500 tars, ~500GB total transfer) and
+   selectively extracts only the ~1.58M clean-subset images, streaming one
+   shard at a time (never holding the full 500GB on disk at once), resumable
+   via `.done` markers per shard. **RUN AND COMPLETE.** Output:
+   `/media/sdb1/gldv2-clean/images/*.jpg` + `manifest.csv` (image_id,
+   landmark_id, local_path) on the gpu-ml host (NOT in Docker — gpu-ml also
+   serves as the household NAS, `/media/sdb1` is one of its drives, chosen
+   for available space at decision time).
+2. ✅ **`gpu-ml/inference-service/tasks/embed_image.py`** — generic,
+   NOT landmark-specific image-embedding HTTP task (`POST
+   /v1/infer/embed_image`), registered in `tasks/__init__.py`. Requires
+   `HF_TOKEN` (HuggingFace access token, gated-model download) as an env var
+   on the container, wired via `docker-compose.yml`. **BUILT, TESTED LIVE**
+   — a real curl call returned a genuine 384-dim embedding vector. Refactored
+   this session to expose a reusable `.embed(image) -> np.ndarray` method
+   (not just the HTTP-facing `.infer()`) specifically so a future matching
+   task can share this same loaded model instance rather than loading a
+   second copy of DINOv3 into the shared 6GB VRAM budget.
+3. ✅ **`gpu-ml/landmark-reference/embed_reference_set.py`** — bulk-embeds
+   all 1.58M reference images, batched (64 images per GPU forward pass, not
+   one HTTP call per image — the right tool for a one-time job at this
+   scale, chosen deliberately over reusing the per-image HTTP task for this
+   step). Chunked (50,000 images/chunk, ~32 chunks) + resumable, same
+   `.done`-marker pattern as the download script. **RUN AND COMPLETE** —
+   `using CUDA` confirmed in the log (not a CPU fallback), all 1,580,470
+   images embedded with zero drops. Output: `chunk_NNNN.npy` (embeddings) +
+   `chunk_NNNN.csv` (image_id, landmark_id) pairs at
+   `/media/sdb1/gldv2-clean/embeddings/` on the gpu-ml host — **~2.4GB
+   total, NOT yet loaded anywhere for actual matching.**
+   - Real dependency gap hit and fixed along the way: `transformers`'
+     `AutoImageProcessor` needs `torchvision` (not just `torch`) as a
+     backend — wasn't in this standalone venv's `requirements.txt` (the
+     Docker container never hit this because `ultralytics`, installed there
+     for `object_detect`, pulls `torchvision` in transitively). Pinned
+     `torchvision==0.20.1` per PyTorch's own official compatibility table
+     for `torch==2.5.1`.
+4. ❌ **NOT YET BUILT — the matching task itself.** Was about to be built
+   this session (a `match_landmark` task: takes a query image, embeds it via
+   the *shared* `EmbedImageTask.embed()`, computes cosine similarity against
+   the loaded reference matrix, returns top-k landmark matches) when a real,
+   **unresolved infrastructure question came up — START HERE next
+   session:**
+
+   **OPEN QUESTION, blocking further work:** the reference embeddings live
+   on gpu-ml's host filesystem (`/media/sdb1/gldv2-clean/embeddings/`,
+   computed outside Docker). The `inference-service` container currently has
+   no way to see that path — a straightforward fix would be a read-only
+   Docker bind mount (`- /media/sdb1/gldv2-clean/embeddings:/reference-embeddings:ro`
+   in `docker-compose.yml`), but the person flagged this as conflicting with
+   their network's build philosophy and asked to move the embeddings to "a
+   NAS folder instead." **Not yet clarified:** whether this means (a) a
+   different specific path on one of gpu-ml's existing NAS drives (still a
+   host bind mount, just relocated), or (b) accessing the data via a proper
+   network-storage mechanism instead of a raw host bind mount — this
+   project's `docker-compose.yml` already has a precedent for that exact
+   distinction: `photo-search/docker-compose.yml`'s `immich_upload` volume
+   uses an explicit NFS-backed Docker volume
+   (`driver_opts: {type: nfs, device: ..., addr: ...}`), not a plain bind
+   mount, specifically because it's NAS-hosted data. **First step next
+   session: ask which of these (or something else) is meant before writing
+   the Docker/volume config for the matching task.**
+
+   Also still open, deferred until the matching task is actually built:
+   - **Landmark ID → name mapping.** GLDv2 only labels images with a numeric
+     `landmark_id`; there's no clean name in the dataset itself. Confirmed
+     via the dataset's own repo: `train_label_to_category.csv`
+     (`https://s3.amazonaws.com/google-landmark/metadata/train_label_to_category.csv`,
+     landmark_id → a Wikimedia Commons category URL) is the real source —
+     not yet downloaded/parsed. Plan: derive a rough display name from the
+     URL's trailing path segment (e.g. `.../Category:Eiffel_Tower` →
+     "Eiffel Tower") — a commonly-used approach for this exact dataset, but
+     a rough parse, not a curated name; expect some odd-looking results.
+   - **Similarity threshold and top-k.** No empirical calibration yet for
+     what cosine-similarity score should count as "a real match" for this
+     model/dataset — same "unvalidated starting guess, revisit with real
+     data" situation as `overture_landmarks.py`'s `MIN_CONFIDENCE`/
+     `MAX_DISTANCE_METERS` were before real testing.
+   - **`sidecar/enrichment/dinov3_landmarks.py`** (the actual sidecar-side
+     enrichment client) hasn't been started at all yet. Candidate scope,
+     already agreed: always include no-coordinate photos (untouched by
+     `overture_landmarks`) + coordinate photos where `overture_landmarks`
+     found zero matches; deprioritize/skip photos that already got a
+     proximity match.
+
+**Schema:** `landmark_matches.source` and `.distance_meters` columns exist
+(added via `ensure_schema.py`, see above) — `distance_meters` will be `NULL`
+for `source='dinov3_visual'` rows, same pattern as `resolved_geo.county`
+being `NULL` for the `immich_reverse_geocode` source.
+
+## Schema evolution tooling (DONE, 2026-08)
+
+`sidecar/db.py`'s `ensure_column()`/`ensure_table()` + `sidecar/ensure_schema.py`
+— see "Implementation status" above. Already dogfooded twice (`landmark_matches.source`,
+then `.distance_meters`).
 
 ## Future enrichment candidates (2026-08)
 
-Two accepted for the roadmap (not yet built — after the current landmark-matching
-work, which is next):
+Two accepted for the roadmap, not yet built (after DINOv3 landmark matching
+is finished):
 
 - **Audio-to-text for videos** — model chosen: **`faster-whisper`** (an
   optimized reimplementation of OpenAI's Whisper, ~4x faster with lower
@@ -213,30 +294,19 @@ work, which is next):
   benchmarks, but pull in the heavier NeMo toolkit for no clear payoff at
   this scale) and managed APIs (Deepgram, AssemblyAI, Groq-hosted Whisper —
   all send data externally and cost per-minute, inconsistent with this
-  project's self-hosted ethos). Batch/offline fits this project's existing
-  "no deadline, run overnight" pattern — no need for the streaming/real-time
-  capability those alternatives compete on. Strong fit for the
-  `inference-service` task-registry pattern (a new task, same protocol) —
-  good candidate to prove the registry's reusability beyond `object_detect`.
+  project's self-hosted ethos). Strong fit for the `inference-service`
+  task-registry pattern (a new task, same protocol) — good candidate to
+  prove the registry's reusability beyond `object_detect`/`embed_image`.
 - **Scene/relationship captioning** — model chosen: **Florence-2**
   (Microsoft, MIT license). Fills a real, distinct gap: `object_counts`
   (YOLO-World) answers *what* is in a photo and *how many*, but not
   relationships, actions, or context ("kids building a sandcastle" vs. a
-  disconnected `person`/`sand`/`bucket` list) — something CLIP's holistic
-  embedding also doesn't reliably surface.
+  disconnected `person`/`sand`/`bucket` list).
   - **Explicitly does NOT replace YOLO-World** — researched and confirmed
-    2026-08: the two excel at genuinely different things. YOLO-World is a
-    dedicated, purpose-built detector optimized for fast, efficient
-    per-class counting across a batch (its whole existing job); Florence-2
+    2026-08: YOLO-World is a dedicated, purpose-built detector optimized for
+    fast, efficient per-class counting (its whole existing job); Florence-2
     is a general multi-task VLM whose real strength is language generation.
-    An independent comparison of these exact models for production
-    deployment states it directly: "YOLO-World's speed... Florence-2's
-    language generation" — different strengths, not competing for the same
-    one. For this project's actual workload (batch-processing potentially
-    thousands of photos overnight on a shared 6GB GPU), a lighter
-    purpose-built detector doing one pass per image is also the better
-    throughput fit than a heavier general VLM doing double duty.
-  - Same complementary-sources pattern as landmark matching (visual +
+    Same complementary-sources pattern as landmark matching (visual +
     proximity) — multiple distinct enrichments each contributing a
     different kind of fact, not one enrichment superseding another.
   - Minor, non-blocking note: YOLO-World inherits Ultralytics' GPL-3.0
@@ -248,14 +318,15 @@ work, which is next):
 ## GPU/VRAM constraint (still holds)
 
 The gpu-ml box's GTX 1060 has 6GB VRAM shared across `immich-machine-learning`,
-`ollama`, and now `inference-service`. Confirmed working for `object_detect`
-(YOLO-World small variant, single worker, lazy model loading) — see
-`gpu-ml/README.md`'s VRAM contention note. Any new task (visual landmark
-model, audio-to-text) needs to fit within this same shared budget or be
-scheduled to avoid overlap; not yet stress-tested under simultaneous load
-from multiple services.
+`ollama`, and now `inference-service` (which itself hosts both YOLO-World and
+DINOv3 as separate tasks in one process). Confirmed working for `object_detect`
+and `embed_image` individually (single worker, lazy model loading per task —
+see `gpu-ml/README.md`'s VRAM contention note). **Not yet tested: both
+YOLO-World and DINOv3 loaded simultaneously in the same container under real
+concurrent load** — worth watching once the matching task is live and both
+tasks might realistically be invoked close together in time.
 
-## Process & infrastructure decisions (2026-07, still holding)
+## Process & infrastructure decisions (2026-07/08, still holding)
 
 - **Two containers.** `search-api` (prod) stays completely sidecar-blind —
   no dependency on the sidecar code or DB. `search-api-dev` (same
@@ -268,9 +339,14 @@ from multiple services.
   - **Prod (`sidecar_prod`, not yet built):** will need its own backup
     mechanism.
 - **Repo layout.** `sidecar/` is a top-level folder, sibling to `search-api/`.
-  `gpu-ml` is its own separate repo, one device serving multiple projects.
+  `gpu-ml` is its own separate repo, one device serving multiple projects —
+  and, as of this session, also confirmed to be the household NAS (multiple
+  large drives mounted at `/media/*`), which matters for where large
+  datasets/models should live and how containers should access them (see the
+  open volume-mount question above — this is the first time that NAS role
+  has actually mattered for a design decision).
 - **Schema shape.** Per-tool typed tables, not EAV — proven correct in
-  practice across three real enrichment tools now.
+  practice across four real enrichment tools now.
 - **UUID stability caveat.** Immich UUIDs are not move-proof. Policy:
   reaugment under the new UUID when it appears; dead duplicates cleaned up
   via Immich's own "Remove offline files" job.
@@ -278,30 +354,37 @@ from multiple services.
   in `sidecar.test_set` — live now, includes the original 5 geocode hard
   cases (2 resolved, 3 correctly-null-in-wilderness) plus a multi-face photo.
 
-## Next steps (agreed order, 2026-08)
+## Next steps (2026-08, latest)
 
-1. ~~Update this design doc~~ **Done.**
-2. ~~Research current visual-landmark-recognition options~~ **Done — DINOv3
-   chosen** (see "Landmark matching" above).
-3. **Build schema evolution tooling** (`ensure_column`/`ensure_table` in
-   `sidecar/db.py`).
-4. **Add `landmark_matches.source`** using the new tooling — first real
-   dogfood use of it.
-5. **Spike Overture's Places theme schema** (mirrors
-   `spike_overture_schema.py`'s approach for Divisions) — don't guess column
-   names given the project's track record on this.
-6. **Build `overture_landmarks.py`** (proximity matching) — reuses proven
-   `overture_geocode.py`-shaped infrastructure.
-7. **Build the visual landmark-matching task** (DINOv3) — including deciding
-   the reference-landmark-set source (see open question above).
-8. **Wire the side-car into the search agent** — still not started. Extend
+1. **Resolve the volume-mount/NAS-access question** (see "Landmark matching
+   — DINOv3 implementation progress" above) — the very next thing to do,
+   before writing more code. Ask directly rather than guessing: does "move
+   to a NAS folder" mean a different host path (still a bind mount) or an
+   NFS-backed Docker volume (matching the existing `immich_upload` pattern
+   in `photo-search/docker-compose.yml`)?
+2. **Build the `match_landmark` task** on `gpu-ml` — loads the reference
+   embeddings (however they end up being mounted/accessed), shares the
+   already-loaded DINOv3 model via `EmbedImageTask.embed()`, computes cosine
+   similarity, returns top-k matches. Needs the landmark_id → name mapping
+   (`train_label_to_category.csv`, not yet downloaded) and an initial
+   similarity threshold (unvalidated guess, to be revisited with real data).
+3. **Build `sidecar/enrichment/dinov3_landmarks.py`** — the client side,
+   same shape as the other enrichment tools; candidate scope already agreed
+   (see above).
+4. **Test end-to-end against the pinned test set**, same discipline as every
+   other enrichment tool here — expect real surprises in the actual match
+   quality/threshold, same as `overture_landmarks.py`'s category-noise
+   discovery.
+5. **Wire the side-car into the search agent** — still not started. Extend
    `run_readonly_sql`'s readable allowlist (or add structured filters) so
-   `resolved_geo`/`object_counts`/`landmark_matches` are queryable. This was
-   explicitly deferred until the enrichment tools themselves were proven —
-   that's now true for two of three planned tables.
-9. **Run the full-library pass** (`--scope full`) for whichever enrichments
-   are trusted — deferred until after the search agent can actually use the
+   `resolved_geo`/`object_counts`/`landmark_matches` are queryable. Explicitly
+   deferred until the enrichment tools themselves were proven — three of
+   four planned tables are there now, the fourth (DINOv3 landmarks) close.
+6. **Run the full-library pass** (`--scope full`) for whichever enrichments
+   are trusted — still deferred until the search agent can actually use the
    data, so there's a real payoff to point at before spending the batch time.
+7. **Audio-to-text (`faster-whisper`) and scene captioning (Florence-2)** —
+   accepted future candidates, not yet started, come after the above.
 
 ## Pointers into existing code/docs
 
@@ -311,13 +394,17 @@ from multiple services.
 - `search-api/tools.py` — `search_photos` filters (people/cities match modes);
   where structured augmentation filters could be added.
 - `search-api/landmark/` — the existing curated CLIP-embedding landmark
-  matcher that a visual landmark-matching task would layer onto, not replace.
-- `gpu-ml/` — the shared GPU device (own repo). `gpu-ml/inference-service/` —
-  the generic task-registry inference protocol; `tasks/object_detect.py` is
-  the reference implementation for adding a new task (e.g. visual landmark
-  matching via DINOv3, audio-to-text).
-- `sidecar/` — the side-car codebase: `migrations/`, `db.py`, `config.py`,
+  matcher that DINOv3 visual matching would layer onto, not replace.
+- `gpu-ml/` — the shared GPU device (own repo; also the household NAS).
+  `gpu-ml/inference-service/` — the generic task-registry inference
+  protocol (`object_detect`, `embed_image`). `gpu-ml/landmark-reference/` —
+  one-off batch scripts (`download_gldv2_clean.py`, `embed_reference_set.py`),
+  run directly on the host in a venv, not through Docker.
+- `sidecar/` — the side-car codebase: `migrations/`, `db.py`
+  (incl. `ensure_column`/`ensure_table`), `config.py`, `ensure_schema.py`,
   `test_set.py`, `populate_test_set.py`, `enrichment/` (`reverse_geocode.py`,
-  `overture_geocode.py`, `object_detect.py`), `run_*.py` entry points,
-  `spike_overture_schema.py` (schema-verification pattern to reuse for
-  Overture's Places theme).
+  `overture_geocode.py`, `object_detect.py`, `overture_landmarks.py`;
+  `dinov3_landmarks.py` not yet created), `run_*.py` entry points,
+  `spike_overture_schema.py` / `spike_overture_places_schema.py`
+  (schema-verification pattern, reuse if a third Overture theme is ever
+  needed).
