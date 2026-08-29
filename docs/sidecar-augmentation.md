@@ -4,13 +4,13 @@
 dev test set (reverse-geocode x2, object detection, landmark proximity).
 The DINOv3 visual-landmark-matching pipeline is deep in progress: model
 access granted, full reference dataset downloaded AND embedded (1.58M
-images), generic embedding endpoint built and tested on gpu-ml. The one
-remaining piece — the actual matching endpoint — is blocked on one open
-infrastructure decision (see "Landmark matching — DINOv3 implementation
-progress" below) that needs to be resolved at the start of the next
-session before writing more code. This note is the living record of
-what's built, why, and what's next; update it as things change rather
-than letting chat history be the only record.
+images), generic embedding endpoint built and tested on gpu-ml. The
+volume-mount/NAS-access question is now resolved (NFS-backed Docker
+volume — see "Landmark matching — DINOv3 implementation progress" below)
+and `match_landmark.py` has been scaffolded on gpu-ml; it is not yet tested
+end-to-end (see "Next steps"). This note is the living record of what's
+built, why, and what's next; update it as things change rather than letting
+chat history be the only record.
 
 ---
 
@@ -67,7 +67,7 @@ What's actually built and proven, mapped to real files:
 | Reverse-geocode (Overture Divisions, richer/county-level) | `sidecar/enrichment/overture_geocode.py` | Working, tested full test_set | `source='overture_divisions'`; chains off the first — only runs on photos still unresolved |
 | Object detection (YOLO-World) | `sidecar/enrichment/object_detect.py` + `gpu-ml/inference-service/tasks/object_detect.py` | Working, tested full test_set | 106-term open vocabulary, see `sidecar/config.py` |
 | Landmark matching, proximity (Overture Places) | `sidecar/enrichment/overture_landmarks.py` | Working, tested full test_set (v2 category filter) | `source='overture_places'`; residential-building noise partially filtered — see design doc history for the `landmark_and_historical_building` taxonomy caveat |
-| Landmark matching, visual (DINOv3) | `sidecar/enrichment/dinov3_landmarks.py` | **NOT YET BUILT** — see detailed status below | Generic embedding piece done; matching + sidecar client remain |
+| Landmark matching, visual (DINOv3) | `sidecar/enrichment/dinov3_landmarks.py` | **NOT YET BUILT** — see detailed status below | `gpu-ml/inference-service/tasks/match_landmark.py` scaffolded and registered; sidecar-side client remains |
 
 Supporting infrastructure built along the way:
 
@@ -96,8 +96,9 @@ Supporting infrastructure built along the way:
   new tasks, not new services. Deliberately decoupled from Immich — callers
   send raw image bytes, not asset IDs, so the service stays reusable across
   projects. Registered tasks: `object_detect` (YOLO-World), `embed_image`
-  (DINOv3, generic — see below). Audio-to-text (`faster-whisper`) and scene
-  captioning (Florence-2) are accepted future candidates, not yet built.
+  (DINOv3, generic — see below), `match_landmark` (see below, scaffolded not
+  yet tested). Audio-to-text (`faster-whisper`) and scene captioning
+  (Florence-2) are accepted future candidates, not yet built.
 - **`psycopg2.connect(**kwargs)`, never a DSN string**, everywhere in
   `sidecar/`. The real Postgres password contains `%` and `!`, which broke a
   plain DSN string (`postgresql://user:pass@host/db`) on first real
@@ -215,7 +216,7 @@ download and the embedding run completed with zero discrepancy.
    images embedded with zero drops. Output: `chunk_NNNN.npy` (embeddings) +
    `chunk_NNNN.csv` (image_id, landmark_id) pairs at
    `/media/sdb1/gldv2-clean/embeddings/` on the gpu-ml host — **~2.4GB
-   total, NOT yet loaded anywhere for actual matching.**
+   total.**
    - Real dependency gap hit and fixed along the way: `transformers`'
      `AutoImageProcessor` needs `torchvision` (not just `torch`) as a
      backend — wasn't in this standalone venv's `requirements.txt` (the
@@ -223,47 +224,63 @@ download and the embedding run completed with zero discrepancy.
      for `object_detect`, pulls `torchvision` in transitively). Pinned
      `torchvision==0.20.1` per PyTorch's own official compatibility table
      for `torch==2.5.1`.
-4. ❌ **NOT YET BUILT — the matching task itself.** Was about to be built
-   this session (a `match_landmark` task: takes a query image, embeds it via
-   the *shared* `EmbedImageTask.embed()`, computes cosine similarity against
-   the loaded reference matrix, returns top-k landmark matches) when a real,
-   **unresolved infrastructure question came up — START HERE next
-   session:**
+4. ✅ **Volume-mount/NAS-access question — RESOLVED (2026-08).** The
+   reference embeddings live on gpu-ml's host filesystem
+   (`/media/sdb1/gldv2-clean/embeddings/`, computed outside Docker), and
+   `inference-service` needs a way to see that path. **Decision: an
+   NFS-backed Docker volume, not a host bind mount** — matching
+   `photo-search/docker-compose.yml`'s existing `immich_upload` pattern
+   exactly (`driver_opts: {type: nfs, device: ..., addr: ...}`).
 
-   **OPEN QUESTION, blocking further work:** the reference embeddings live
-   on gpu-ml's host filesystem (`/media/sdb1/gldv2-clean/embeddings/`,
-   computed outside Docker). The `inference-service` container currently has
-   no way to see that path — a straightforward fix would be a read-only
-   Docker bind mount (`- /media/sdb1/gldv2-clean/embeddings:/reference-embeddings:ro`
-   in `docker-compose.yml`), but the person flagged this as conflicting with
-   their network's build philosophy and asked to move the embeddings to "a
-   NAS folder instead." **Not yet clarified:** whether this means (a) a
-   different specific path on one of gpu-ml's existing NAS drives (still a
-   host bind mount, just relocated), or (b) accessing the data via a proper
-   network-storage mechanism instead of a raw host bind mount — this
-   project's `docker-compose.yml` already has a precedent for that exact
-   distinction: `photo-search/docker-compose.yml`'s `immich_upload` volume
-   uses an explicit NFS-backed Docker volume
-   (`driver_opts: {type: nfs, device: ..., addr: ...}`), not a plain bind
-   mount, specifically because it's NAS-hosted data. **First step next
-   session: ask which of these (or something else) is meant before writing
-   the Docker/volume config for the matching task.**
+   Rationale, for the record: gpu-ml's `inference-service` container
+   currently happens to run on the same host as the embeddings (gpu-ml is
+   also the household NAS), which would make a plain bind mount work today.
+   But the household's whole Docker architecture is built around containers
+   being mobile/reproducible from compose + an optional Dockerfile, with a
+   single consistent NAS-access pattern deliberately preferred over
+   host-specific bind mounts — one location to troubleshoot instead of a
+   different access method per container. Same-host-today doesn't guarantee
+   same-host-always, so the NFS volume is the correct choice even though it
+   adds a network hop the bind mount wouldn't have needed right now.
 
-   Also still open, deferred until the matching task is actually built:
+   Implemented in `gpu-ml/docker-compose.yml`'s new `landmark_embeddings`
+   volume (mounted read-only at `/reference-embeddings` in
+   `inference-service`) and documented in `gpu-ml/.env.example`
+   (`NAS_IP`, `NAS_LANDMARK_EMBEDDINGS_PATH`).
+
+   **Still outstanding, blocking a real end-to-end test:** the actual NFS
+   export itself has not been set up on the NAS side yet (e.g. via
+   `/etc/exports` on gpu-ml, pointing at
+   `/media/sdb1/gldv2-clean/embeddings`) — this is a host/sysadmin step, not
+   a code change, and hasn't been done. Until it exists, the
+   `landmark_embeddings` volume will fail to mount.
+
+5. ✅ **`gpu-ml/inference-service/tasks/match_landmark.py`** — scaffolded
+   this session. Takes a query image, embeds it via the *shared*
+   `EmbedImageTask.embed()` (registered together in `tasks/__init__.py`),
+   L2-normalizes and loads the reference chunks lazily from
+   `/reference-embeddings`, computes cosine similarity via a single dot
+   product against the pre-normalized reference matrix, returns top-k
+   matches as `{"landmark_id": str, "similarity": float}`. **NOT YET
+   TESTED** — blocked on the NFS export above; no real query has been run
+   against the loaded reference matrix yet.
+
+   Also still open, deferred until real testing is possible:
    - **Landmark ID → name mapping.** GLDv2 only labels images with a numeric
      `landmark_id`; there's no clean name in the dataset itself. Confirmed
      via the dataset's own repo: `train_label_to_category.csv`
      (`https://s3.amazonaws.com/google-landmark/metadata/train_label_to_category.csv`,
      landmark_id → a Wikimedia Commons category URL) is the real source —
-     not yet downloaded/parsed. Plan: derive a rough display name from the
-     URL's trailing path segment (e.g. `.../Category:Eiffel_Tower` →
+     not yet downloaded/parsed. `match_landmark.py` currently returns the
+     raw numeric `landmark_id` only. Plan: derive a rough display name from
+     the URL's trailing path segment (e.g. `.../Category:Eiffel_Tower` →
      "Eiffel Tower") — a commonly-used approach for this exact dataset, but
      a rough parse, not a curated name; expect some odd-looking results.
-   - **Similarity threshold and top-k.** No empirical calibration yet for
-     what cosine-similarity score should count as "a real match" for this
-     model/dataset — same "unvalidated starting guess, revisit with real
-     data" situation as `overture_landmarks.py`'s `MIN_CONFIDENCE`/
-     `MAX_DISTANCE_METERS` were before real testing.
+   - **Similarity threshold and top-k.** `MIN_SIMILARITY = 0.7` in
+     `match_landmark.py` is an unvalidated starting guess — same
+     "unvalidated starting guess, revisit with real data" situation as
+     `overture_landmarks.py`'s `MIN_CONFIDENCE`/`MAX_DISTANCE_METERS` were
+     before real testing.
    - **`sidecar/enrichment/dinov3_landmarks.py`** (the actual sidecar-side
      enrichment client) hasn't been started at all yet. Candidate scope,
      already agreed: always include no-coordinate photos (untouched by
@@ -342,9 +359,14 @@ tasks might realistically be invoked close together in time.
   `gpu-ml` is its own separate repo, one device serving multiple projects —
   and, as of this session, also confirmed to be the household NAS (multiple
   large drives mounted at `/media/*`), which matters for where large
-  datasets/models should live and how containers should access them (see the
-  open volume-mount question above — this is the first time that NAS role
-  has actually mattered for a design decision).
+  datasets/models should live and how containers should access them.
+- **NAS access: NFS-backed Docker volumes, always, even for same-host
+  cases.** Confirmed as a deliberate, general household policy (not just a
+  one-off for landmark embeddings): the whole Docker architecture is built
+  on containers being mobile/reproducible from compose, so one consistent
+  NAS-access mechanism is preferred over deciding per-container whether a
+  bind mount would technically work today. See "Landmark matching — DINOv3
+  implementation progress" above for the concrete case this was decided on.
 - **Schema shape.** Per-tool typed tables, not EAV — proven correct in
   practice across four real enrichment tools now.
 - **UUID stability caveat.** Immich UUIDs are not move-proof. Policy:
@@ -356,25 +378,21 @@ tasks might realistically be invoked close together in time.
 
 ## Next steps (2026-08, latest)
 
-1. **Resolve the volume-mount/NAS-access question** (see "Landmark matching
-   — DINOv3 implementation progress" above) — the very next thing to do,
-   before writing more code. Ask directly rather than guessing: does "move
-   to a NAS folder" mean a different host path (still a bind mount) or an
-   NFS-backed Docker volume (matching the existing `immich_upload` pattern
-   in `photo-search/docker-compose.yml`)?
-2. **Build the `match_landmark` task** on `gpu-ml` — loads the reference
-   embeddings (however they end up being mounted/accessed), shares the
-   already-loaded DINOv3 model via `EmbedImageTask.embed()`, computes cosine
-   similarity, returns top-k matches. Needs the landmark_id → name mapping
-   (`train_label_to_category.csv`, not yet downloaded) and an initial
-   similarity threshold (unvalidated guess, to be revisited with real data).
-3. **Build `sidecar/enrichment/dinov3_landmarks.py`** — the client side,
+1. ✅ **Resolve the volume-mount/NAS-access question** — done, see
+   "Landmark matching — DINOv3 implementation progress" above. NFS-backed
+   Docker volume, matching `immich_upload`.
+2. **Set up the actual NFS export on the NAS side** (e.g. `/etc/exports` on
+   gpu-ml, pointing at `/media/sdb1/gldv2-clean/embeddings`) — a host
+   config step, not code, and the current hard blocker on testing anything
+   below. `gpu-ml/.env.example`'s `NAS_LANDMARK_EMBEDDINGS_PATH` documents
+   the expected export path.
+3. **Test `match_landmark.py` end-to-end** against the pinned test set once
+   the export exists — expect real surprises in match quality/threshold,
+   same as `overture_landmarks.py`'s category-noise discovery. Calibrate
+   `MIN_SIMILARITY` and `DEFAULT_TOP_K` against real results.
+4. **Build `sidecar/enrichment/dinov3_landmarks.py`** — the client side,
    same shape as the other enrichment tools; candidate scope already agreed
    (see above).
-4. **Test end-to-end against the pinned test set**, same discipline as every
-   other enrichment tool here — expect real surprises in the actual match
-   quality/threshold, same as `overture_landmarks.py`'s category-noise
-   discovery.
 5. **Wire the side-car into the search agent** — still not started. Extend
    `run_readonly_sql`'s readable allowlist (or add structured filters) so
    `resolved_geo`/`object_counts`/`landmark_matches` are queryable. Explicitly
@@ -397,9 +415,11 @@ tasks might realistically be invoked close together in time.
   matcher that DINOv3 visual matching would layer onto, not replace.
 - `gpu-ml/` — the shared GPU device (own repo; also the household NAS).
   `gpu-ml/inference-service/` — the generic task-registry inference
-  protocol (`object_detect`, `embed_image`). `gpu-ml/landmark-reference/` —
-  one-off batch scripts (`download_gldv2_clean.py`, `embed_reference_set.py`),
-  run directly on the host in a venv, not through Docker.
+  protocol (`object_detect`, `embed_image`, `match_landmark`).
+  `gpu-ml/landmark-reference/` — one-off batch scripts
+  (`download_gldv2_clean.py`, `embed_reference_set.py`), run directly on the
+  host in a venv, not through Docker. `gpu-ml/.env.example` — documents
+  `HF_TOKEN`, `NAS_IP`, `NAS_LANDMARK_EMBEDDINGS_PATH`.
 - `sidecar/` — the side-car codebase: `migrations/`, `db.py`
   (incl. `ensure_column`/`ensure_table`), `config.py`, `ensure_schema.py`,
   `test_set.py`, `populate_test_set.py`, `enrichment/` (`reverse_geocode.py`,
