@@ -18,6 +18,20 @@ The landmark_id -> name CSV lives on the NAS (LABEL_CSV_PATH, below), not
 downloaded fresh from s3.amazonaws.com on every run -- see LABEL_CSV_PATH's
 comment for why.
 
+Candidate photos are filtered to asset.type = 'IMAGE' (see
+find_disney_photos()) -- an earlier version queried asset_exif alone,
+which also pulled in videos sharing GPS coordinates with a paired photo;
+PIL correctly can't open video bytes as an image, so every one of those
+failed after a slow full-file download, wasting real time for zero data.
+Live 2026-08 run against the real library: ~1,744 raw candidates before
+this fix.
+
+Given that raw-candidate count, --limit (default 500, see main() below)
+doesn't just truncate -- it stratified-samples across the full date range
+first (see _sample_spread_over_time()), so a run of any --limit still
+covers the whole photo history rather than clustering around whichever
+single visit happened to contribute the most photos.
+
 Run inside search-api-dev (needs Immich Postgres + gpu-ml LAN access):
     python -m sidecar.dinov3_landmark_report
 
@@ -30,6 +44,7 @@ import io
 import json
 import logging
 import os
+import random
 import urllib.parse
 import urllib.request
 
@@ -50,6 +65,7 @@ DISNEY_LON_MIN, DISNEY_LON_MAX = -81.64, -81.50
 
 TOP_K = 5
 DEFAULT_MIN_SIMILARITY = 0.7  # matches match_landmark.py's own default -- override to inspect weaker candidates
+DEFAULT_LIMIT = 500
 MAX_LONG_EDGE = 1024  # for the copy sent to match_landmark, same reasoning as object_detect.py's _prepare_image_bytes
 
 LABEL_CSV_URL = "https://s3.amazonaws.com/google-landmark/metadata/train_label_to_hierarchical.csv"
@@ -73,15 +89,53 @@ def _get_immich_connection():
 
 
 def find_disney_photos():
-    """Photos with GPS coordinates inside the WDW bounding box."""
+    """
+    Photos (not videos -- see module docstring) with GPS coordinates inside
+    the WDW bounding box, sorted by capture date. Sorted (not just
+    filtered) specifically so _sample_spread_over_time() can bucket by
+    position in this list as a proxy for position in time.
+    """
     query = (
-        'SELECT "assetId", latitude, longitude FROM asset_exif '
-        "WHERE latitude BETWEEN %s AND %s AND longitude BETWEEN %s AND %s"
+        'SELECT ae."assetId", ae.latitude, ae.longitude, a."fileCreatedAt" '
+        'FROM asset_exif ae '
+        'JOIN asset a ON a.id = ae."assetId" '
+        'WHERE ae.latitude BETWEEN %s AND %s AND ae.longitude BETWEEN %s AND %s '
+        'AND a."deletedAt" IS NULL AND a.visibility = \'timeline\' '
+        'AND a."isOffline" = false AND a.type = \'IMAGE\' '
+        'ORDER BY a."fileCreatedAt"'
     )
     with _get_immich_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, (DISNEY_LAT_MIN, DISNEY_LAT_MAX, DISNEY_LON_MIN, DISNEY_LON_MAX))
-            return cur.fetchall()  # [(asset_id, lat, lon), ...]
+            return cur.fetchall()  # [(asset_id, lat, lon, created_at), ...], sorted by created_at
+
+
+def _sample_spread_over_time(rows, limit, seed=None):
+    """
+    rows: assumed already sorted by capture date (see find_disney_photos()).
+    Splits into `limit` equal-sized consecutive slices along that sorted
+    order and picks ONE random row from each slice -- a stratified sample,
+    not a plain random.sample(). Plain random sampling over a library with
+    uneven visit frequency would still end up dominated by whichever visit
+    contributed the most photos; bucketing by position-in-time first
+    guarantees roughly even coverage across the whole date range, with
+    randomness only within each narrow time slice.
+
+    seed: optional, for a reproducible sample across reruns (e.g. to compare
+    two different min_similarity values against the exact same 500 photos).
+    """
+    rnd = random.Random(seed)
+    n = len(rows)
+    if n <= limit:
+        return rows
+    bucket_size = n / limit
+    selected = []
+    for i in range(limit):
+        start = int(i * bucket_size)
+        end = max(int((i + 1) * bucket_size), start + 1)
+        end = min(end, n)
+        selected.append(rnd.choice(rows[start:end]))
+    return selected
 
 
 def _ensure_label_csv():
@@ -149,22 +203,34 @@ def _html_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def build_report(min_similarity=DEFAULT_MIN_SIMILARITY):
+def build_report(min_similarity=DEFAULT_MIN_SIMILARITY, limit=DEFAULT_LIMIT, seed=None):
     """
     min_similarity: passed through to match_landmark's own min_similarity
     param (default 0.7, same as the task's server-side default). Lower this
     to see weak/borderline matches that would otherwise come back as "no
-    match" -- e.g. build_report(min_similarity=0.4) to inspect everything
-    down to a much looser threshold.
+    match".
+    limit: max photos to process. If the raw candidate count exceeds this,
+    stratified-samples across the full date range (see
+    _sample_spread_over_time()) rather than truncating to however find_disney_photos()
+    happened to order them. Pass None to process every candidate (slow --
+    ~1,744 raw candidates as of 2026-08, at highly variable per-photo time).
+    seed: optional int, for a reproducible sample across reruns.
     """
     immich = ImmichClient()
     label_map = _load_label_map()
 
-    candidates = find_disney_photos()
-    logger.info(f"{len(candidates)} Disney World photo(s) found by GPS")
+    all_candidates = find_disney_photos()
+    logger.info(f"{len(all_candidates)} Disney World photo(s) found by GPS (asset.type = IMAGE)")
+
+    if limit is not None:
+        candidates = _sample_spread_over_time(all_candidates, limit, seed=seed)
+        logger.info(f"sampled {len(candidates)} photo(s), spread across the full date range "
+                    f"({all_candidates[0][3]} to {all_candidates[-1][3]})")
+    else:
+        candidates = all_candidates
 
     rows_html = []
-    for asset_id, lat, lon in candidates:
+    for asset_id, lat, lon, created_at in candidates:
         try:
             thumb_bytes, thumb_content_type = immich.thumbnail_response(asset_id)
             raw = immich.original_stream(asset_id).content
@@ -202,6 +268,7 @@ def build_report(min_similarity=DEFAULT_MIN_SIMILARITY):
         <div class="card">
           {img_tag}
           <div class="info">
+            <div class="date">{created_at}</div>
             {match_html}
             <a href="{view_url}" target="_blank">open in Immich</a>
           </div>
@@ -215,11 +282,12 @@ def build_report(min_similarity=DEFAULT_MIN_SIMILARITY):
 <title>DINOv3 Landmark Match -- Disney World test set</title>
 <style>
   body {{ font-family: sans-serif; background: #222; color: #eee; margin: 2em; }}
-  h1 {{ font-size: 1.2em; }}
+  h1 {{ font-size: 1.1em; }}
   .grid {{ display: flex; flex-wrap: wrap; gap: 1em; }}
   .card {{ width: 280px; background: #333; border-radius: 8px; overflow: hidden; }}
   .card img {{ width: 100%; display: block; }}
   .info {{ padding: 0.75em; font-size: 0.9em; }}
+  .date {{ color: #999; font-size: 0.8em; margin-bottom: 0.4em; }}
   .match {{ margin-bottom: 0.3em; }}
   .no-match {{ color: #888; }}
   .error {{ color: #e77; }}
@@ -227,7 +295,8 @@ def build_report(min_similarity=DEFAULT_MIN_SIMILARITY):
 </style>
 </head>
 <body>
-<h1>{len(candidates)} Disney World photo(s), matched against DINOv3 GLDv2 reference set (top {TOP_K}, min_similarity={min_similarity:.3f})</h1>
+<h1>{len(candidates)} of {len(all_candidates)} Disney World photo(s) (sampled, spread across full date range) &mdash;
+DINOv3 GLDv2 match, top {TOP_K}, min_similarity={min_similarity:.3f}</h1>
 <div class="grid">
 {"".join(rows_html)}
 </div>
@@ -245,5 +314,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-similarity", type=float, default=DEFAULT_MIN_SIMILARITY,
                          help=f"Minimum cosine similarity to count as a match (default {DEFAULT_MIN_SIMILARITY})")
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
+                         help=f"Max photos to process, stratified-sampled across the full date range "
+                              f"if the raw candidate count exceeds this (default {DEFAULT_LIMIT}). "
+                              f"Pass 0 to process every candidate.")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Optional seed for a reproducible sample across reruns")
     args = parser.parse_args()
-    build_report(min_similarity=args.min_similarity)
+    build_report(
+        min_similarity=args.min_similarity,
+        limit=None if args.limit == 0 else args.limit,
+        seed=args.seed,
+    )
