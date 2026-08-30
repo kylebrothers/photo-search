@@ -98,6 +98,16 @@ services:
       - PYTHONPATH=/app
     volumes:
       - ./sidecar:/app/sidecar
+      # Same NAS folder gpu-ml/inference-service mounts read-only for the
+      # DINOv3 reference embeddings (see gpu-ml/docker-compose.yml's
+      # gpu_ml_landmark_embeddings volume) -- mounted here read-write so
+      # sidecar/dinov3_landmark_report.py can store a durable local copy of
+      # the GLDv2 landmark_id -> name CSV instead of depending on
+      # s3.amazonaws.com being reachable every run. Same device/path, same
+      # NAS_IP already used by immich_upload below -- one NAS folder,
+      # shared by both projects' Docker stacks via the standard NFS-volume
+      # pattern, not two separate copies of the same data.
+      - gpu_ml_landmark_embeddings:/reference-embeddings
     ports:
       - "5001:5000"
     depends_on:
@@ -115,3 +125,17 @@ volumes:
       type: nfs
       device: ":${NAS_THUMBS_PATH}"
       o: "nfsvers=4,addr=${NAS_IP},nolock,soft,rw"
+  # Same NAS export as gpu-ml/docker-compose.yml's gpu_ml_landmark_embeddings
+  # volume (device path and NAS_IP both match exactly) -- Docker treats this
+  # as a distinct named volume per compose project, but it's the same
+  # underlying NFS folder, mounted rw here (vs. ro on gpu-ml's side) so this
+  # project can write the label CSV. Requires the NAS's NFS export itself to
+  # permit write access from this host too, not just gpu-ml -- if it's
+  # locked to a single client, this mount will fail on write even though it
+  # mounts successfully.
+  gpu_ml_landmark_embeddings:
+    driver: local
+    driver_opts:
+      type: nfs
+      device: ":/Docker/gpu-ml/landmark-embeddings"
+      o: "nfsvers=4,addr=${NAS_IP:-192.168.0.134},nolock,soft,rw"
