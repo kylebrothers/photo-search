@@ -14,9 +14,10 @@ than hardcoded, so a lower value can be used here specifically to inspect
 weak/borderline matches that the task's own 0.7 default would otherwise
 filter out entirely -- see build_report()'s min_similarity argument.
 
-The landmark_id -> name CSV lives on the NAS (LABEL_CSV_PATH, below), not
-downloaded fresh from s3.amazonaws.com on every run -- see LABEL_CSV_PATH's
-comment for why.
+Landmark_id -> name resolution now lives in sidecar/landmark_labels.py,
+shared with sidecar/enrichment/dinov3_landmarks.py (the real enrichment
+client) -- factored out specifically so there aren't two copies of "how to
+parse a display name from this CSV" that could drift apart.
 
 Candidate photos are filtered to asset.type = 'IMAGE' (see
 find_disney_photos()) -- an earlier version queried asset_exif alone,
@@ -39,19 +40,17 @@ Output: sidecar/output/dinov3_disney_report.html (host-visible via the
 existing ./sidecar bind mount in docker-compose.yml).
 """
 import base64
-import csv
 import io
 import json
 import logging
 import os
 import random
-import urllib.parse
-import urllib.request
 
 import psycopg2
 import requests
 
 from . import config
+from . import landmark_labels
 from immich_client import ImmichClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -67,18 +66,6 @@ TOP_K = 5
 DEFAULT_MIN_SIMILARITY = 0.7  # matches match_landmark.py's own default -- override to inspect weaker candidates
 DEFAULT_LIMIT = 500
 MAX_LONG_EDGE = 1024  # for the copy sent to match_landmark, same reasoning as object_detect.py's _prepare_image_bytes
-
-LABEL_CSV_URL = "https://s3.amazonaws.com/google-landmark/metadata/train_label_to_hierarchical.csv"
-# Same NAS folder gpu-ml/inference-service mounts read-only for the
-# reference embeddings (see gpu-ml/docker-compose.yml's
-# gpu_ml_landmark_embeddings volume), mounted read-write here (see this
-# project's own docker-compose.yml). Stored here rather than re-downloaded
-# from S3 every run -- s3.amazonaws.com/google-landmark isn't ours to rely
-# on staying reachable indefinitely, and this way the label mapping lives
-# in the same durable, single NAS location as the reference embeddings
-# themselves, not a second copy in a container-local cache that
-# disappears on rebuild.
-LABEL_CSV_PATH = "/reference-embeddings/train_label_to_hierarchical.csv"
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "dinov3_disney_report.html")
@@ -138,41 +125,6 @@ def _sample_spread_over_time(rows, limit, seed=None):
     return selected
 
 
-def _ensure_label_csv():
-    """Download the GLDv2 landmark_id -> Wikimedia category mapping onto
-    the shared NAS folder, but only if it isn't already there -- one-time
-    per NAS, not per container/run. Requires the gpu_ml_landmark_embeddings
-    mount to be writable from this host (see docker-compose.yml's comment
-    on that volume) -- if the NAS export is locked read-only to gpu-ml
-    specifically, this write will fail; the fix is on the NAS export config,
-    not here."""
-    if os.path.exists(LABEL_CSV_PATH):
-        return
-    logger.info(f"downloading landmark label mapping to {LABEL_CSV_PATH} (one-time)...")
-    urllib.request.urlretrieve(LABEL_CSV_URL, LABEL_CSV_PATH)
-
-
-def _load_label_map():
-    """
-    Returns {landmark_id: display_name}. display_name is derived from the
-    Wikimedia category URL's trailing path segment (e.g.
-    ".../Category:Parvis_Notre-Dame_-_place_Jean-Paul-II" ->
-    "Parvis Notre-Dame - place Jean-Paul-II") -- a rough parse, not a
-    curated name; expect some odd-looking results.
-    """
-    _ensure_label_csv()
-    label_map = {}
-    with open(LABEL_CSV_PATH, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            category_url = row.get("category", "")
-            segment = category_url.rsplit(":", 1)[-1] if ":" in category_url else category_url
-            name = urllib.parse.unquote(segment).replace("_", " ").strip()
-            label_map[row["landmark_id"]] = name or f"landmark {row['landmark_id']}"
-    logger.info(f"loaded {len(label_map)} landmark labels")
-    return label_map
-
-
 def _prepare_image_bytes(raw_bytes):
     """Downscale to MAX_LONG_EDGE if needed, re-encode as JPEG -- same
     reasoning as object_detect.py's _prepare_image_bytes."""
@@ -211,13 +163,14 @@ def build_report(min_similarity=DEFAULT_MIN_SIMILARITY, limit=DEFAULT_LIMIT, see
     match".
     limit: max photos to process. If the raw candidate count exceeds this,
     stratified-samples across the full date range (see
-    _sample_spread_over_time()) rather than truncating to however find_disney_photos()
-    happened to order them. Pass None to process every candidate (slow --
-    ~1,744 raw candidates as of 2026-08, at highly variable per-photo time).
+    _sample_spread_over_time()) rather than truncating to however
+    find_disney_photos() happened to order them. Pass None to process every
+    candidate (slow -- ~1,744 raw candidates as of 2026-08, at highly
+    variable per-photo time).
     seed: optional int, for a reproducible sample across reruns.
     """
     immich = ImmichClient()
-    label_map = _load_label_map()
+    label_map = landmark_labels.load_label_map()
 
     all_candidates = find_disney_photos()
     logger.info(f"{len(all_candidates)} Disney World photo(s) found by GPS (asset.type = IMAGE)")
@@ -252,7 +205,7 @@ def build_report(min_similarity=DEFAULT_MIN_SIMILARITY, limit=DEFAULT_LIMIT, see
         else:
             lines = []
             for m in matches:
-                name = label_map.get(m["landmark_id"], f"landmark {m['landmark_id']}")
+                name = landmark_labels.resolve_name(m["landmark_id"], label_map)
                 lines.append(
                     f'<div class="match"><strong>{_html_escape(name)}</strong> '
                     f'&mdash; {m["similarity"]:.3f}</div>'

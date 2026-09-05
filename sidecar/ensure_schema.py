@@ -37,6 +37,17 @@ def run():
     db.ensure_column("landmark_matches", "distance_meters", "double precision")
     logger.info("ensured: landmark_matches.distance_meters")
 
+    # landmark_matches.landmark_id: added 2026-08 for dinov3_landmarks.py.
+    # landmark_name is a human-readable, PARSED (see sidecar/landmark_labels.py)
+    # display string -- exactly the field the planned "landmark name
+    # overrides" tool (docs/sidecar-augmentation.md) will let a user
+    # manually correct. landmark_id is GLDv2's own stable numeric
+    # identifier and won't change under an override, so it's the correct
+    # thing to group/cluster DINOv3 matches by, not landmark_name. NULL for
+    # overture_places rows (proximity matches have no GLDv2 landmark_id).
+    db.ensure_column("landmark_matches", "landmark_id", "text")
+    logger.info("ensured: landmark_matches.landmark_id")
+
     # Add future schema evolutions here, e.g.:
     # db.ensure_column("resolved_geo", "some_new_field", "text")
 
