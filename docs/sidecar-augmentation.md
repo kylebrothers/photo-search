@@ -3,15 +3,17 @@
 **Status (2026-09, latest):** all four planned enrichment tools are now
 built (reverse-geocode x2, object detection, landmark proximity, and
 DINOv3 visual landmark matching's real client,
-`sidecar/enrichment/dinov3_landmarks.py`). The side-car is now wired into
-the search agent: a second, independently-toggled read-only SQL tool
-(`run_readonly_sidecar_sql`) reaches the sidecar database, composed with
-Immich-side queries via the existing `combine_results` handle mechanism —
-see "Wiring the side-car into the search agent" below for the full design
-and why. This is dev-only for now (`search-api-dev`); production
-`search-api` remains sidecar-blind by config absence, same as always. This
-note is the living record of what's built, why, and what's next; update it
-as things change rather than letting chat history be the only record.
+`sidecar/enrichment/dinov3_landmarks.py`). The side-car is wired into the
+search agent via a second, independently-toggled read-only SQL tool
+(`run_readonly_sidecar_sql`) — but a real, confirmed prompt-adherence
+failure was found in initial testing (see "Wiring the side-car into the
+search agent" below): the agent used CLIP alone for a named-landmark query
+and never touched the sidecar. The system prompt has been rewritten with a
+more prominent general principle to fix this; **not yet re-tested**. A
+cron job for incremental full-library enrichment now exists (see
+"Incremental updates — cron job"). This note is the living record of
+what's built, why, and what's next; update it as things change rather than
+letting chat history be the only record.
 
 ---
 
@@ -29,9 +31,11 @@ of gap remain, and both point at the same solution:
    for "Florida."
 2. **Structured facts CLIP can't give reliably.** "Is Kevin alone in frame"
    (person count), object/animal/vehicle counts, scene tags — CLIP is a
-   holistic embedding and can't be trusted for counts or exclusivity. The SQL
-   agent tool can *express* these queries, but only if the underlying facts
-   exist somewhere queryable.
+   holistic embedding and can't be trusted for counts or exclusivity, and (as
+   confirmed empirically, see below) can't be trusted to confirm a SPECIFIC
+   named entity like a landmark either — it's fooled by anything that merely
+   looks visually similar. The SQL agent tool can *express* these queries,
+   but only if the underlying facts exist somewhere queryable.
 
 Both are the same shape: **per-photo facts that should be computed once and
 stored somewhere the search agent can query.** That store is the side-car.
@@ -53,9 +57,10 @@ stored somewhere the search agent can query.** That store is the side-car.
 - **Open-ended by design.** The goal is not one feature but a framework: many
   future tools, each contributing a different kind of per-photo fact, all keyed
   by UUID.
-- **Feeds the existing agent.** Augmentation data is now queryable via a
+- **Feeds the existing agent.** Augmentation data is queryable via a
   dedicated second SQL tool (see "Wiring the side-car into the search
-  agent" below) — **DONE, 2026-09**, dev-only.
+  agent" below) — built, but prompt adherence needs a fix + retest (see
+  status above).
 
 ## Implementation status (2026-09, latest)
 
@@ -69,8 +74,10 @@ What's actually built and proven, mapped to real files:
 | Landmark matching, proximity (Overture Places) | `sidecar/enrichment/overture_landmarks.py` | Working, tested full test_set (v2 category filter) | `source='overture_places'`; residential-building noise partially filtered — see design doc history for the `landmark_and_historical_building` taxonomy caveat |
 | Landmark matching, visual (DINOv3) | `sidecar/enrichment/dinov3_landmarks.py` | **Built.** Not yet run at `--scope full` | `source='dinov3_visual'`; candidate scope = all images minus ones `overture_landmarks` already matched; stores `landmark_id` (GLDv2's stable numeric ID) alongside `landmark_name` specifically so the planned name-overrides tool can group on the ID, not the name |
 
-All four enrichments are queryable from the search agent as of this
-session — see "Wiring the side-car into the search agent" below.
+**Real data as of 2026-09** (test-set-scope only so far):
+`landmark_matches` has 497 `overture_places` rows and 6 `dinov3_visual`
+rows — confirmed via a live query. This is expected to grow substantially
+once the cron job (below) runs `--scope full` for the first time.
 
 Supporting infrastructure built along the way:
 
@@ -174,8 +181,9 @@ start, not the deprecated field.
 proximity (`overture_landmarks.py`, done above) are genuinely complementary,
 not primary+fallback — catches landmarks a photo has no useful GPS for,
 lesser-known landmarks outside any fixed vocabulary, and tightly-cropped
-photos. The search agent now consults both (see the two-SQL-tool design
-below), not one in preference to the other.
+photos. The search agent is intended to consult both (see the two-SQL-tool
+design below), not one in preference to the other — pending the
+prompt-adherence fix and retest.
 
 **Model: DINOv3 ViT-S+** (`facebook/dinov3-vits16plus-pretrain-lvd1689m`,
 ~29M params), gated on HuggingFace (license approved 2026-08).
@@ -224,7 +232,7 @@ volume convention — see `flask-app-template/README.md`).
    `top_k=1` per photo (unlike the diagnostic report's `top_k=5` — for a
    *stored* row, the single best visual match is what's meaningful).
    `sidecar/run_dinov3_landmarks.py` is the entry point. **Not yet run at
-   `--scope full`** — see "Next steps."
+   `--scope full`** — see "Next steps" and "Incremental updates" below.
 
 **Schema:** `landmark_matches.source`, `.distance_meters`, and
 `.landmark_id` columns all exist (via `ensure_schema.py`). `landmark_id`
@@ -256,7 +264,7 @@ GLDv2's sparse metadata.
 Next steps below) — clustering needs enough real match data across the
 whole library to be worth reviewing.
 
-## Wiring the side-car into the search agent (DONE, 2026-09)
+## Wiring the side-car into the search agent (BUILT 2026-09, prompt fix pending retest)
 
 **The problem:** Immich's database and the sidecar database are
 deliberately separate Postgres databases (see "Core design decisions" —
@@ -295,23 +303,47 @@ connects to Immich's database only.
   database. Grants `SELECT` on `landmark_matches`, `object_counts`,
   `resolved_geo` only — `enrichment_status` deliberately excluded (internal
   bookkeeping, not search-relevant, and its `error_detail` strings
-  shouldn't be agent-readable).
+  shouldn't be agent-readable). **Confirmed live** via a real grants query
+  — exactly 3 tables.
 - **`search-api/config.py`** — new `SIDECAR_SQL_READONLY_DSN` (empty by
   default) and `AGENT_SIDECAR_SQL_ENABLED` (`false` by default). Both
-  unset on production `search-api` — sidecar-blindness there is now
-  enforced purely by config absence, the same mechanism that already kept
-  it sidecar-blind, not a special-cased code path.
+  unset on production `search-api` — sidecar-blindness there is enforced
+  purely by config absence. **Confirmed live** on `search-api-dev`.
 - **`search-api/tools.py`** — `build_tool_schemas()` gained an
   `include_sidecar_sql` parameter, independent of `include_sql`.
   `combine_results` itself needed NO changes — it already worked on
   arbitrary handles.
-- **`search-api/search_agent.py`** — the executors map and system prompt
-  both updated: the agent is told to use `run_readonly_sidecar_sql` for a
-  named landmark, an object count, or county-level location, and — when a
-  query needs both a sidecar fact and an Immich fact (e.g. "Kevin's photos
-  of the Eiffel Tower") — to run one query against each database and
-  combine the two handles with `combine_results`, never to attempt both in
-  a single request to either tool.
+- **`search-api/search_agent.py`** — executors map updated; system prompt
+  updated (see next section for why it needed a rewrite).
+
+**Real failure found in first live test (2026-09):** query "photos of the
+Eiffel Tower" against the initial prompt wording used ONLY `search_photos`
+(CLIP) and returned CLIP's generic 100-result page — `trace` showed
+`search_photos` -> `finalize_search`, `run_readonly_sidecar_sql` never
+called at all. The original prompt buried the landmark guidance as one
+bullet among many under "How to work"; Haiku didn't reliably act on it.
+
+**Fix, not yet retested:** the system prompt was rewritten to promote a
+standalone, prominently-placed general principle — "STRUCTURED DATA BEATS
+FUZZY VISUAL SIMILARITY" — stated once, near the top, rather than a
+per-case rule. The principle: whenever a query names something a
+structured tool could confirm precisely (a landmark, an object count, a
+county, a person, exact text), run search_photos for broad recall AND the
+relevant structured tool, then `combine_results(mode='union',
+base_handle=<structured handle>)` — the structured handle's ordering
+(landmarks by confidence, counts by count — see `sql_tool.py`'s
+`_SIDECAR_SQL_SYSTEM_PROMPT`, which now instructs `ORDER BY ... DESC`)
+becomes the FRONT of the combined list, with CLIP's broader results
+filling in after. This is real promotion-by-position, not a new scoring
+mechanism — it reuses `combine_results`' existing union-preserves-base-order
+behavior.
+
+**Honest caveat, stated in the code comments too:** a general principle is
+more maintainable (it should cover future sidecar tables without another
+prompt edit) but is NOT proven to be more reliably followed by Haiku than
+the specific rule that just failed — this is a real trade-off, not a
+strict improvement, and needs the retest below to confirm it actually
+works before being trusted.
 
 **Promoting to production later** (once `sidecar_prod` exists): re-run
 `create_sidecar_readonly_role.sql` against `sidecar_prod`, set
@@ -319,10 +351,44 @@ connects to Immich's database only.
 production `search-api`'s environment. No code change — this was the
 explicit point of the DB-agnostic factory design.
 
-**Not yet done:** re-running the structured test list (README) against
-queries that actually exercise `run_readonly_sidecar_sql` and the
-cross-database `combine_results` pattern — this has been wired but not
-yet validated against real test queries.
+**Not yet done:** retesting "photos of the Eiffel Tower" and a
+count-based query (e.g. "photos with 3 or more dogs") against the rewritten
+prompt, to confirm the fix actually works — see "Next steps."
+
+## Incremental updates — cron job (DONE, 2026-09)
+
+**The gap:** every enrichment tool has `--scope full` vs `--scope test`
+and a `skip_done` flag (making reruns idempotent/cheap), but nothing
+TRIGGERS a rerun automatically — every full-library pass before this was a
+manual `docker exec`. For a photo library that keeps growing, that's a
+real gap.
+
+**Considered:** an Immich upload webhook (near-real-time, but needs a new
+receiver endpoint, auth, and fires a GPU job on every single upload rather
+than batched) vs. a simple cron job (fits this project's existing pattern
+of one-shot scripts, no daemon, batched). **Cron chosen** — simplicity
+matched to how everything else here already runs; a webhook remains an
+option later if near-real-time enrichment turns out to matter.
+
+**`scripts/run_all_enrichments.sh`** — new, host-side (cron runs on the Pi
+host, not inside a container). Calls each enrichment's entry point inside
+`search-api-dev` via `docker exec ... --scope full`, in a deliberate order:
+`reverse_geocode` -> `overture_geocode` -> `object_detect` ->
+`overture_landmarks` -> `dinov3_landmarks` LAST. `dinov3_landmarks` is the
+only one doing a full-resolution download + GPU inference round trip per
+candidate and can run for hours at full scope on a real library —
+ordering it last means the other three always complete even if it's still
+running or gets interrupted. Every step relies on `skip_done` (default
+behavior, no `--no-skip-done`) — this IS the incremental mechanism: a
+"rerun everything" cron job costs almost nothing for photos already
+processed, so no separate "only new photos" code path was needed.
+
+**Not yet installed** — the script exists in the repo; the actual
+`crontab -e` entry (documented in the script's own header) still needs to
+be added on the Pi:
+```
+0 2 * * * /home/kyle/photo-search/scripts/run_all_enrichments.sh >> /home/kyle/photo-search/logs/enrichment/cron.log 2>&1
+```
 
 ## Schema evolution tooling (DONE, 2026-08)
 
@@ -373,8 +439,10 @@ DINOv3 as separate tasks in one process). Confirmed working for `object_detect`,
 `embed_image`, and `match_landmark` individually (single worker, lazy model
 loading per task — see `gpu-ml/README.md`'s VRAM contention note). **Not yet
 tested: YOLO-World and DINOv3 loaded and actively inferring at the same
-time** — worth watching once `dinov3_landmarks.py` runs at `--scope full`
-and could realistically overlap with an `object_detect` pass.
+time** — the cron job's sequential ordering (object_detect before
+dinov3_landmarks, never concurrent within one run) avoids this for now, but
+a second cron run overlapping a slow first run, or a manual invocation
+overlapping the cron schedule, could still trigger it — worth watching.
 
 ## Process & infrastructure decisions (2026-07/09, still holding)
 
@@ -399,11 +467,17 @@ and could realistically overlap with an `object_detect` pass.
   for the full reasoning — this is now the established pattern for any
   future case where the agent needs to correlate data across genuinely
   separate databases.
+- **Incremental updates: cron + `skip_done`, not a webhook.** See
+  "Incremental updates — cron job." A webhook remains a considered
+  alternative if near-real-time enrichment ever becomes a real requirement.
 - **Repo layout.** `sidecar/` is a top-level folder, sibling to `search-api/`.
   `gpu-ml` is its own separate repo, one device serving multiple projects —
   and also confirmed to be the household NAS (multiple large drives
   mounted at `/media/*`), which matters for where large datasets/models
-  should live and how containers should access them.
+  should live and how containers should access them. `scripts/` is a
+  top-level folder for host-side (non-containerized) utility scripts —
+  `run_all_enrichments.sh` and the existing `check_asset_exists.py` both
+  live there.
 - **NAS access: NFS-backed Docker volumes, always, even for same-host
   cases.** Confirmed as a deliberate, general household policy: the whole
   Docker architecture is built on containers being mobile/reproducible
@@ -431,21 +505,22 @@ and could realistically overlap with an `object_detect` pass.
 2. ✅ **Set up the actual NFS export on the NAS side** — done.
 3. ✅ **Test `match_landmark.py` end-to-end** — done, against 500 real
    photos. `min_similarity = 0.7` confirmed as a good cutoff.
-4. ✅ **Build `sidecar/enrichment/dinov3_landmarks.py`** — done. Not yet
-   run at `--scope full` (see 6 below).
-5. ✅ **Wire the side-car into the search agent** — done, see "Wiring the
-   side-car into the search agent" above. Dev-only for now.
-6. **Run the full-library pass** (`--scope full`) for `dinov3_landmarks.py`
-   specifically (the other three enrichments' full-library status should
-   be double-checked too) — this is also the prerequisite for the
-   landmark-name-overrides tool (needs a full library's worth of matches
-   to usefully cluster).
-7. **Re-run the structured test list against `run_readonly_sidecar_sql`
-   and cross-database `combine_results` queries** — the wiring exists but
-   hasn't been validated against real test queries yet (e.g. "photos of
-   the Eiffel Tower", "Kevin's photos with 3+ dogs").
+4. ✅ **Build `sidecar/enrichment/dinov3_landmarks.py`** — done.
+5. ✅ **Wire the side-car into the search agent (initial build)** — done,
+   but see 6 below — a real prompt-adherence bug was found and a fix
+   shipped, not yet retested.
+6. **Retest the sidecar wiring** against the rewritten system prompt: rerun
+   "photos of the Eiffel Tower" (expect `run_readonly_sidecar_sql` AND
+   `search_photos` in the trace, combined via `combine_results`) and a
+   count query (e.g. "photos with 3 or more dogs"). This is the immediate
+   next action — do this BEFORE trusting the wiring for anything else.
+7. **Run the full-library pass** — install the cron job's crontab entry
+   (see "Incremental updates" above) or run
+   `scripts/run_all_enrichments.sh` manually once. This is also the
+   prerequisite for the landmark-name-overrides tool (needs a full
+   library's worth of matches to usefully cluster).
 8. **Build the landmark name overrides tool** — see its own section above.
-   Scoped for after the full-collection pass (6).
+   Scoped for after the full-collection pass (7).
 9. **Audio-to-text (`faster-whisper`) and scene captioning (Florence-2)** —
    accepted future candidates, not yet started, come after the above.
 
@@ -461,7 +536,8 @@ and could realistically overlap with an `object_detect` pass.
   modes), `combine_results` (the cross-tool/cross-database composition
   mechanism), `build_tool_schemas()`.
 - `search-api/search_agent.py` — the agent loop and system prompt,
-  including when to use `run_readonly_sidecar_sql` vs. `run_readonly_sql`.
+  including the "STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY" principle
+  and when to use `run_readonly_sidecar_sql` vs. `run_readonly_sql`.
 - `search-api/landmark/` — the existing curated CLIP-embedding landmark
   matcher that DINOv3 visual matching layers onto, not replaces.
 - `gpu-ml/` — the shared GPU device (own repo; also the household NAS).
@@ -481,6 +557,8 @@ and could realistically overlap with an `object_detect` pass.
   `spike_overture_schema.py` / `spike_overture_places_schema.py`
   (schema-verification pattern, reuse if a third Overture theme is ever
   needed).
+- `scripts/` — host-side (non-containerized) utility scripts:
+  `run_all_enrichments.sh` (the cron entry point), `check_asset_exists.py`.
 - `flask-app-template/README.md` — the household's standard NAS volume
   convention (`{appname}_{purpose}` naming, hardcoded device paths,
   `NAS_IP`-only env parameterization), followed by
