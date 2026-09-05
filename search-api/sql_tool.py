@@ -51,6 +51,15 @@ Dual-path result handling (reference-based, see tools.py):
 
 Model split: SQL generation uses a SEPARATE Claude call with SQL_MODEL, not
 the orchestration model, for both instances — see config.py.
+
+Ordering matters for the sidecar tool specifically (added 2026-09): when a
+sidecar photo-set handle becomes combine_results' base_handle in a union
+with a CLIP search_photos handle (see search_agent.py's "STRUCTURED DATA
+BEATS FUZZY VISUAL SIMILARITY" principle), the union's ordering follows
+base_handle's ordering first — so the sidecar SQL-generation prompt
+instructs the model to ORDER BY confidence DESC on landmark/object-count
+lookups, putting the strongest structured matches first in the combined
+result rather than in whatever order Postgres happens to return them.
 """
 
 import logging
@@ -375,11 +384,17 @@ running two separate tool calls and combining their handles with \
 combine_results at the agent level, not by this tool.
 - Cap results: end the query with an appropriate LIMIT (never return more than \
 {row_cap} rows).
+- For a PHOTO-set query, ORDER BY the relevant quality signal DESCENDING \
+(confidence for landmark_matches, count for object_counts) so the strongest \
+matches come first — this ordering is preserved when the caller later unions \
+this result with a broader CLIP search, putting your best matches at the \
+front of the combined list.
 
 Two kinds of query — pick by what the request asks for:
 - If the request wants a SET OF PHOTOS, select the id column exactly as \
 named in the schema below: `SELECT asset_id ... `. Select ONLY asset_id \
-(plus what you need to filter/order).
+(plus what you need to filter/order — the ORDER BY column itself does not \
+need to be selected).
 - If the request wants a VALUE to use later (e.g. confirming a landmark name \
 exists), select it normally and do NOT select asset_id.
 
@@ -423,10 +438,11 @@ Guidance for common requests:
 - Landmark name search (PHOTO set): match landmark_name with ILIKE — it's a \
 rough, sometimes messy parsed display name, not a curated one, so avoid \
 requiring an exact match. Add a confidence floor if the request implies \
-"definitely"/"clearly" (e.g. confidence > 0.75); leave it loose otherwise.
+"definitely"/"clearly" (e.g. confidence > 0.75); leave it loose otherwise. \
+ORDER BY confidence DESC (see hard rules above).
 - Object/count search (PHOTO set): filter object_counts.class with ILIKE or \
 exact match; add a numeric comparison on count if the request implies a \
-specific quantity (e.g. "3 or more dogs" -> count >= 3).
+specific quantity (e.g. "3 or more dogs" -> count >= 3). ORDER BY count DESC.
 - County-level or finer place search (PHOTO set or VALUE lookup): \
 resolved_geo.county exists here but not in the main database — useful when \
 a request needs finer granularity than city/state/country alone provides."""
@@ -442,12 +458,15 @@ RUN_READONLY_SIDECAR_SQL_SCHEMA, execute_run_readonly_sidecar_sql = make_readonl
         "data including county (resolved_geo). Use this when a request "
         "needs one of THOSE specific kinds of fact — a named landmark, an "
         "object count, a county — that search_photos and run_readonly_sql "
-        "can't express. This is a genuinely SEPARATE database from "
+        "can't express. IMPORTANT: for a named landmark or object count, "
+        "this does NOT replace search_photos — run BOTH (see the agent's "
+        "system prompt, 'STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY') "
+        "and combine them with combine_results, mode='union', this tool's "
+        "handle as base_handle. This is a genuinely SEPARATE database from "
         "run_readonly_sql's; it cannot be joined against the main database "
-        "in one query. If a request needs BOTH (e.g. a specific person AND "
-        "a landmark), run each as its own query — this tool for the "
-        "landmark/object/county part, run_readonly_sql for the person/"
-        "place/date part — and combine the two handles with "
+        "in one query. If a request needs BOTH a sidecar fact AND a "
+        "main-database fact (e.g. a specific person AND a landmark), run "
+        "each as its own query and combine the two handles with "
         "combine_results. Returns a handle + count for a photo set, or "
         "inline rows for a value lookup. Never use it to modify data."
     ),

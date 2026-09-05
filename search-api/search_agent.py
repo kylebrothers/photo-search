@@ -35,6 +35,25 @@ queries needing both compose two tool calls and a combine_results, not one
 query. AGENT_SIDECAR_SQL_ENABLED defaults to false; only search-api-dev
 sets it true today (search-api stays sidecar-blind by config absence, same
 as always).
+
+Real failure found and fixed 2026-09: a landmark-specific bullet buried
+among several other "How to work" bullets was NOT enough to reliably get
+Haiku to call run_readonly_sidecar_sql at all — a live test of "photos of
+the Eiffel Tower" used ONLY search_photos (CLIP) and returned CLIP's
+generic 100-result page, never touching the sidecar. Fixed by promoting
+the underlying idea to a standalone, prominently-placed principle
+("Structured data beats fuzzy visual similarity") stated once, generally,
+rather than a growing list of per-case rules (landmarks today, counts and
+counties already, more later) — a general principle should generalize to
+future sidecar enrichments without another prompt edit, though it is
+NOT proven to be more reliably followed than the specific rule that just
+failed; this is a real, acknowledged trade-off, and worth confirming with
+the structured test list (README) rather than assuming it worked from a
+single example. When it fires correctly, search_photos and the relevant
+structured tool BOTH run, combined via combine_results(mode='union',
+base_handle=<structured>) — this is genuine promotion-by-position (the
+structured, precise match set is listed first; CLIP's broader recall fills
+in after), not a new scoring mechanism.
 """
 
 import json
@@ -75,6 +94,32 @@ id and search; do not stop to ask what kind of photos are wanted. If a query \
 is genuinely ambiguous, pick the most likely reading, run the search, and note \
 the assumption in finalize_search's explanation.
 
+STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY — CHECK BOTH:
+search_photos' object_query runs on CLIP, a broad visual-similarity embedding. \
+CLIP is excellent for open-ended scene/object description ("sunset over \
+water", "a dog") but UNRELIABLE for confirming a SPECIFIC named thing — it can \
+be fooled by anything that merely looks similar. Whenever a query names \
+something a structured tool could CONFIRM precisely — a specific named \
+landmark or monument, a specific object/animal COUNT, a county or other \
+fine-grained place, a person, exact text in the photo — do NOT rely on \
+search_photos alone, even though phrasing it as object_query looks like an \
+easy fit. Instead:
+  1. Run search_photos for broad recall (object_query, or a pure metadata \
+search if no visual description applies).
+  2. ALSO run the structured tool that can confirm the specific claim — \
+run_readonly_sql for people/OCR/precise Immich-side facts, \
+run_readonly_sidecar_sql for named landmarks/object counts/county-level \
+place (see that tool's own description for exactly what it covers).
+  3. combine_results(base_handle=<the STRUCTURED handle>, \
+filter_handles=[<the search_photos handle>], mode='union'). This lists \
+confirmed, precise matches FIRST, with CLIP's broader results filling in \
+after — do not skip step 1 just because step 2 found something, and do not \
+skip step 2 just because search_photos already returned results for a \
+plausible-sounding object_query.
+This is a general principle, not a fixed list — apply it to ANY query naming \
+something structured data could confirm, including sidecar tables added \
+after this prompt was written.
+
 How to work:
 - To filter by a person, resolve their name to a person UUID first: call \
 run_readonly_sql for a fuzzy name lookup (it returns the id inline), then pass \
@@ -107,25 +152,27 @@ nothing; use one cities:any search, or union the per-city handles.
 - For predicates search_photos can't express — "only person X in the photo and \
 nobody else", text visible in the image, geo proximity — use run_readonly_sql \
 to SELECT the photo set (it returns a handle).
-- For a NAMED LANDMARK, an object/animal COUNT, or county-level location — \
-things the main database doesn't store — use run_readonly_sidecar_sql \
-instead of run_readonly_sql. It is a SEPARATE database and cannot be joined \
-against the main one in a single query. If a request needs BOTH (e.g. "photos \
-of Kevin at a landmark"), run one query against each database and combine \
-their handles with combine_results — do not try to express both in one \
-request to either tool.
+- For a NAMED LANDMARK, an object/animal COUNT, or county-level location, see \
+"STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY" above — run BOTH search_photos \
+AND run_readonly_sidecar_sql, then union them with the sidecar handle as base. \
+run_readonly_sidecar_sql is a SEPARATE database from run_readonly_sql and \
+cannot be joined against it in a single query — if a request needs a sidecar \
+fact AND an Immich-side fact (e.g. "photos of Kevin at a landmark"), run one \
+query against each and combine their handles with combine_results.
 - combine_results merges result-set handles with mode 'union' (base OR any \
-filter — e.g. beach photos plus mountain photos, or Manhattan photos plus \
-Edgewater photos), 'intersect' (base AND all filters — e.g. beach photos that \
-are ALSO only-Kevin-in-frame, or a person's photos AND a landmark match), or \
+filter — e.g. beach photos plus mountain photos, a confirmed landmark match \
+plus CLIP's broader recall, or Manhattan photos plus Edgewater photos), \
+'intersect' (base AND all filters — e.g. beach photos that are ALSO \
+only-Kevin-in-frame, or a person's photos AND a landmark match), or \
 'subtract' (base minus the filters). Do NOT merge photo ids yourself — you \
 don't have them; use combine_results. Pick the mode deliberately: \
 alternatives/OR -> union; narrowing/AND -> intersect. This is also how \
 results from the two different SQL tools get combined — combine_results \
 works on any handle regardless of which tool produced it.
-- Prefer the fewest tool calls that answer the query correctly. A simple \
-object search with no person/place/date is one search_photos call, then \
-finalize_search.
+- Prefer the fewest tool calls that answer the query correctly, but do NOT \
+sacrifice the structured-data check above for the sake of fewer calls — a \
+named-landmark or count query is not "simple" just because object_query looks \
+like it would work.
 
 A zero-result search means only that nothing matched THIS query — never state \
 or imply that the library is empty or unindexed. Just report that no photos \
