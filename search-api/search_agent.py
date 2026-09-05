@@ -25,6 +25,16 @@ Quick fixes folded in after the max_tokens-truncation incident:
     in finalize_search), so the model doesn't burn a turn narrating.
   - stop_reason == "max_tokens" is logged distinctly as truncation (a config
     problem) rather than being silently lumped in with "model gave up".
+
+Sidecar wiring (docs/sidecar-augmentation.md, "Next steps" #5): the sidecar
+database (landmark_matches/object_counts/resolved_geo) is reached via a
+SECOND, independently-toggled SQL tool (run_readonly_sidecar_sql, see
+sql_tool.py) rather than folded into run_readonly_sql — the two are
+genuinely separate Postgres databases with no cross-database JOIN, so
+queries needing both compose two tool calls and a combine_results, not one
+query. AGENT_SIDECAR_SQL_ENABLED defaults to false; only search-api-dev
+sets it true today (search-api stays sidecar-blind by config absence, same
+as always).
 """
 
 import json
@@ -50,10 +60,11 @@ query (e.g. "last month", "this summer", or a bare month) to a concrete \
 range; do not guess the year.
 
 Result handles:
-- search_photos, run_readonly_sql (photo queries), and combine_results each \
-return a HANDLE to a stored result set plus a count — never the photo ids \
-themselves. You reason about handles ("result_1, 46 photos"); you never see or \
-need the ids. Pass a handle to finalize_search to return those photos.
+- search_photos, run_readonly_sql (photo queries), run_readonly_sidecar_sql \
+(photo queries), and combine_results each return a HANDLE to a stored result \
+set plus a count — never the photo ids themselves. You reason about handles \
+("result_1, 46 photos"); you never see or need the ids. Pass a handle to \
+finalize_search to return those photos.
 
 You get exactly ONE query and cannot ask the user anything back — there is no \
 conversation, and any question you write is discarded and the search fails. So \
@@ -74,20 +85,44 @@ query name may be a nickname, initials, or maiden name that ILIKE can't match \
 the intended person. Only conclude no such person exists after that.
 - To filter by place, resolve the user's place name to a real stored city \
 value the same way — the library stores specific EXIF-derived places (e.g. \
-"Manhattan"), which may differ from a colloquial name (e.g. "New York"). If a \
-place lookup returns no rows, retry ONCE by selecting the DISTINCT cities \
-actually present in the library (SELECT DISTINCT city FROM asset_exif WHERE \
-city IS NOT NULL) — a short list — and pick the closest match yourself before \
-concluding the place isn't represented.
+"Manhattan"), which may differ from a colloquial name (e.g. "New York"). When \
+resolving a place or region, ALWAYS select city, state, AND country together \
+(SELECT DISTINCT city, state, country FROM asset_exif WHERE city IS NOT NULL) \
+— the state and country are what disambiguate a bare city name (e.g. \
+"Edgewater" could be NJ, FL, or CO; only the state tells you which). Reason \
+over that short list using all three fields, then pass the matching city \
+value(s) to search_photos. Do this on the first lookup, not only as a retry.
 - For an object or scene description ("beach", "a dog"), pass it as \
-object_query to search_photos.
+object_query to search_photos. object_query is a SINGLE description — for "beach \
+OR mountain", do two searches and union them (see combine_results below).
+- Filters within search_photos each choose a match mode. people.match "all" \
+means the photo contains EVERY listed person (Kevin AND Sarah together); "any" \
+means ANY of them (Kevin OR Sarah). cities.match "any" means taken in any of \
+the listed cities — use this for a REGION by listing its cities (resolve the \
+region to its stored cities via run_readonly_sql first, selecting city, state, \
+and country so you can tell which cities actually fall in the region, then pass \
+the matching cities). \
+Do not intersect separate single-city searches to cover a region — that yields \
+nothing; use one cities:any search, or union the per-city handles.
 - For predicates search_photos can't express — "only person X in the photo and \
 nobody else", text visible in the image, geo proximity — use run_readonly_sql \
 to SELECT the photo set (it returns a handle).
-- To combine an object search with a SQL-only predicate (e.g. "beach photos \
-where only Kevin is in frame"): get a handle from search_photos and a handle \
-from run_readonly_sql, then call combine_results with mode 'intersect'. Do NOT \
-try to merge photo ids yourself — you don't have them; use combine_results.
+- For a NAMED LANDMARK, an object/animal COUNT, or county-level location — \
+things the main database doesn't store — use run_readonly_sidecar_sql \
+instead of run_readonly_sql. It is a SEPARATE database and cannot be joined \
+against the main one in a single query. If a request needs BOTH (e.g. "photos \
+of Kevin at a landmark"), run one query against each database and combine \
+their handles with combine_results — do not try to express both in one \
+request to either tool.
+- combine_results merges result-set handles with mode 'union' (base OR any \
+filter — e.g. beach photos plus mountain photos, or Manhattan photos plus \
+Edgewater photos), 'intersect' (base AND all filters — e.g. beach photos that \
+are ALSO only-Kevin-in-frame, or a person's photos AND a landmark match), or \
+'subtract' (base minus the filters). Do NOT merge photo ids yourself — you \
+don't have them; use combine_results. Pick the mode deliberately: \
+alternatives/OR -> union; narrowing/AND -> intersect. This is also how \
+results from the two different SQL tools get combined — combine_results \
+works on any handle regardless of which tool produced it.
 - Prefer the fewest tool calls that answer the query correctly. A simple \
 object search with no person/place/date is one search_photos call, then \
 finalize_search.
@@ -122,7 +157,10 @@ def run_search_agent(query_text, immich, claude_client):
     deadline = started + config.AGENT_WALL_CLOCK_TIMEOUT
 
     store = tools_mod.ResultStore()
-    tool_schemas = tools_mod.build_tool_schemas(include_sql=config.AGENT_SQL_ENABLED)
+    tool_schemas = tools_mod.build_tool_schemas(
+        include_sql=config.AGENT_SQL_ENABLED,
+        include_sidecar_sql=config.AGENT_SIDECAR_SQL_ENABLED,
+    )
 
     # Inject today's date so the model resolves relative/bare dates correctly
     # rather than guessing the year (a bare-month query previously landed on the
@@ -137,11 +175,16 @@ def run_search_agent(query_text, immich, claude_client):
         "search_photos": lambda **kw: tools_mod.execute_search_photos(immich, store, **kw),
         "combine_results": lambda **kw: tools_mod.execute_combine_results(store, **kw),
     }
-    if config.AGENT_SQL_ENABLED:
+    if config.AGENT_SQL_ENABLED or config.AGENT_SIDECAR_SQL_ENABLED:
         import sql_tool
-        executors["run_readonly_sql"] = lambda **kw: sql_tool.execute_run_readonly_sql(
-            store, claude_client=claude_client, **kw
-        )
+        if config.AGENT_SQL_ENABLED:
+            executors["run_readonly_sql"] = lambda **kw: sql_tool.execute_run_readonly_sql(
+                store, claude_client=claude_client, **kw
+            )
+        if config.AGENT_SIDECAR_SQL_ENABLED:
+            executors["run_readonly_sidecar_sql"] = lambda **kw: sql_tool.execute_run_readonly_sidecar_sql(
+                store, claude_client=claude_client, **kw
+            )
 
     messages = [{"role": "user", "content": query_text}]
 
@@ -278,11 +321,13 @@ def _fallback(query_text, immich, trace, reason):
         pid for pid in (immich.find_person_id(n) for n in parsed.person_names)
         if pid
     ]
+    people = {"ids": person_ids, "match": "all"} if person_ids else None
+    cities = {"values": [parsed.location], "match": "any"} if parsed.location else None
     asset_ids = tools_mod.run_ranked_search(
         immich,
         object_query=parsed.object_query,
-        person_ids=person_ids,
-        city=parsed.location,
+        people=people,
+        cities=cities,
         date_from=parsed.date_from,
         date_to=parsed.date_to,
     )

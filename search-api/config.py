@@ -59,18 +59,35 @@ AGENT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 # the agent runs with search_photos + finalize_search only.
 AGENT_SQL_ENABLED = os.environ.get("AGENT_SQL_ENABLED", "true").lower() == "true"
 
+# Toggle the run_readonly_sidecar_sql tool (see sql_tool.py's module
+# docstring and docs/sidecar-augmentation.md, "Next steps" #5). Defaults to
+# false so production search-api — which does not set
+# SIDECAR_SQL_READONLY_DSN and is deliberately kept sidecar-blind (see
+# design doc, "Process & infrastructure decisions") — is entirely unaffected
+# by this toggle even existing. search-api-dev sets this to true once its
+# sidecar read-only role exists.
+AGENT_SIDECAR_SQL_ENABLED = os.environ.get("AGENT_SIDECAR_SQL_ENABLED", "false").lower() == "true"
 
-# ── SQL tool (run_readonly_sql) ───────────────────────────────────────────────
-# Connects as a DEDICATED read-only role, NOT the Immich superuser. See
-# sql/create_readonly_role.sql. This DSN's role must have SELECT on only the
-# search allowlist and nothing else — the DSN is the security boundary, the
-# in-process checks are defence in depth.
+
+# ── SQL tools (run_readonly_sql, run_readonly_sidecar_sql) ───────────────────
+# Both connect as a DEDICATED read-only role, NOT a superuser. See
+# sql/create_readonly_role.sql (Immich) and sql/create_sidecar_readonly_role.sql
+# (sidecar). Each DSN's role must have SELECT on only that database's search
+# allowlist and nothing else — the DSN is the security boundary, the
+# in-process checks in sql_tool.py are defence in depth.
 SQL_READONLY_DSN = os.environ.get("SQL_READONLY_DSN", "")
 
-# Hard cap on rows returned to the model (context + cost control). Also
-# instructed as a LIMIT in the SQL-generation prompt; enforced again server-
-# side via fetchmany as a backstop.
+# Unset by default — see AGENT_SIDECAR_SQL_ENABLED above. Set on
+# search-api-dev once sql/create_sidecar_readonly_role.sql has been run
+# against sidecar_dev.
+SIDECAR_SQL_READONLY_DSN = os.environ.get("SIDECAR_SQL_READONLY_DSN", "")
+
+# Hard cap on rows returned to the model (context + cost control). Shared by
+# both SQL tools — not a database-specific concern. Also instructed as a
+# LIMIT in each SQL-generation prompt; enforced again server-side via
+# fetchmany as a backstop.
 SQL_ROW_CAP = int(os.environ.get("SQL_ROW_CAP", "100"))
 
-# Per-statement timeout (ms) applied on the connection.
+# Per-statement timeout (ms) applied on the connection. Shared by both SQL
+# tools.
 SQL_STATEMENT_TIMEOUT_MS = int(os.environ.get("SQL_STATEMENT_TIMEOUT_MS", "5000"))
