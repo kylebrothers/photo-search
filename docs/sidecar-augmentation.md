@@ -1,16 +1,17 @@
 # Photo Metadata Augmentation — Side-car Database (design note)
 
-**Status (2026-08, latest):** four enrichment tools built and proven on the
-dev test set (reverse-geocode x2, object detection, landmark proximity).
-The DINOv3 visual-landmark-matching pipeline is deep in progress: model
-access granted, full reference dataset downloaded AND embedded (1.58M
-images), generic embedding endpoint built and tested on gpu-ml. The
-volume-mount/NAS-access question is now resolved (NFS-backed Docker
-volume — see "Landmark matching — DINOv3 implementation progress" below)
-and `match_landmark.py` has been scaffolded on gpu-ml; it is not yet tested
-end-to-end (see "Next steps"). This note is the living record of what's
-built, why, and what's next; update it as things change rather than letting
-chat history be the only record.
+**Status (2026-09, latest):** all four planned enrichment tools are now
+built (reverse-geocode x2, object detection, landmark proximity, and
+DINOv3 visual landmark matching's real client,
+`sidecar/enrichment/dinov3_landmarks.py`). The side-car is now wired into
+the search agent: a second, independently-toggled read-only SQL tool
+(`run_readonly_sidecar_sql`) reaches the sidecar database, composed with
+Immich-side queries via the existing `combine_results` handle mechanism —
+see "Wiring the side-car into the search agent" below for the full design
+and why. This is dev-only for now (`search-api-dev`); production
+`search-api` remains sidecar-blind by config absence, same as always. This
+note is the living record of what's built, why, and what's next; update it
+as things change rather than letting chat history be the only record.
 
 ---
 
@@ -52,12 +53,11 @@ stored somewhere the search agent can query.** That store is the side-car.
 - **Open-ended by design.** The goal is not one feature but a framework: many
   future tools, each contributing a different kind of per-photo fact, all keyed
   by UUID.
-- **Feeds the existing agent.** Augmentation data becomes queryable by
-  `run_readonly_sql` (and potentially new structured `search_photos` filters),
-  so the agent gains real structured facts instead of inferring frame contents
-  indirectly. **Not yet done** — see "Next steps."
+- **Feeds the existing agent.** Augmentation data is now queryable via a
+  dedicated second SQL tool (see "Wiring the side-car into the search
+  agent" below) — **DONE, 2026-09**, dev-only.
 
-## Implementation status (2026-08, latest)
+## Implementation status (2026-09, latest)
 
 What's actually built and proven, mapped to real files:
 
@@ -67,7 +67,10 @@ What's actually built and proven, mapped to real files:
 | Reverse-geocode (Overture Divisions, richer/county-level) | `sidecar/enrichment/overture_geocode.py` | Working, tested full test_set | `source='overture_divisions'`; chains off the first — only runs on photos still unresolved |
 | Object detection (YOLO-World) | `sidecar/enrichment/object_detect.py` + `gpu-ml/inference-service/tasks/object_detect.py` | Working, tested full test_set | 106-term open vocabulary, see `sidecar/config.py` |
 | Landmark matching, proximity (Overture Places) | `sidecar/enrichment/overture_landmarks.py` | Working, tested full test_set (v2 category filter) | `source='overture_places'`; residential-building noise partially filtered — see design doc history for the `landmark_and_historical_building` taxonomy caveat |
-| Landmark matching, visual (DINOv3) | `sidecar/enrichment/dinov3_landmarks.py` | **NOT YET BUILT** — see detailed status below | `gpu-ml/inference-service/tasks/match_landmark.py` scaffolded and registered; sidecar-side client remains |
+| Landmark matching, visual (DINOv3) | `sidecar/enrichment/dinov3_landmarks.py` | **Built.** Not yet run at `--scope full` | `source='dinov3_visual'`; candidate scope = all images minus ones `overture_landmarks` already matched; stores `landmark_id` (GLDv2's stable numeric ID) alongside `landmark_name` specifically so the planned name-overrides tool can group on the ID, not the name |
+
+All four enrichments are queryable from the search agent as of this
+session — see "Wiring the side-car into the search agent" below.
 
 Supporting infrastructure built along the way:
 
@@ -82,23 +85,29 @@ Supporting infrastructure built along the way:
   `sidecar/populate_test_set.py` manage the pinned ~100-photo set + hand-picked
   hard cases.
 - **`sidecar_dev` database is live**, migration applied, `county` column added
-  to `resolved_geo`, `source` + `distance_meters` columns added to
-  `landmark_matches` (via the new schema-evolution tooling, see below).
+  to `resolved_geo`, `source` + `distance_meters` + `landmark_id` columns
+  added to `landmark_matches` (via the schema-evolution tooling, see below).
 - **`sidecar/db.py` has `ensure_column()`/`ensure_table()`** (idempotent
   `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS`
   wrappers) and **`sidecar/ensure_schema.py`** declares actual schema
   evolutions to apply — run via `python -m sidecar.ensure_schema`. Fixes the
   "typing ALTER TABLE into psql by hand" gap. Add new evolutions there as the
   schema grows.
+- **`sidecar/landmark_labels.py`** — shared `landmark_id` → display-name
+  lookup (parses GLDv2's `train_label_to_hierarchical.csv`, cached durably
+  on the same NAS folder as the reference embeddings). Used by both
+  `dinov3_landmarks.py` and `dinov3_landmark_report.py` — factored out
+  specifically so there's one place parsing this CSV, not two that could
+  drift apart.
 - **A generic, reusable GPU inference protocol on `gpu-ml`**
   (`gpu-ml/inference-service/`): a task-registry pattern (`POST
   /v1/infer/<task>`, `GET /v1/tasks`, `GET /health`) so new models register as
   new tasks, not new services. Deliberately decoupled from Immich — callers
   send raw image bytes, not asset IDs, so the service stays reusable across
   projects. Registered tasks: `object_detect` (YOLO-World), `embed_image`
-  (DINOv3, generic — see below), `match_landmark` (see below, scaffolded not
-  yet tested). Audio-to-text (`faster-whisper`) and scene captioning
-  (Florence-2) are accepted future candidates, not yet built.
+  (DINOv3, generic), `match_landmark` (tested against real data). Audio-to-text
+  (`faster-whisper`) and scene captioning (Florence-2) are accepted future
+  candidates, not yet built.
 - **`psycopg2.connect(**kwargs)`, never a DSN string**, everywhere in
   `sidecar/`. The real Postgres password contains `%` and `!`, which broke a
   plain DSN string (`postgresql://user:pass@host/db`) on first real
@@ -125,11 +134,9 @@ already combined into Immich's own smart-search ranking alongside CLIP
 similarity (confirmed via Immich's architecture docs, and empirically: a
 "Scotland" search surfaced real OCR text matches *and* separately CLIP's own
 well-documented text-sensitivity/visual-pattern matches, both genuinely
-present, not one explaining the other).
-
-**Remaining task, not sidecar work:** confirm `asset_exif.ocrText` is included
-in `search-api/sql_tool.py`'s readable column allowlist so the SQL agent can
-actually query it. A `search-api` check, separate from anything in `sidecar/`.
+present, not one explaining the other). Included in `run_readonly_sql`'s
+existing allowlist and schema prompt (`asset_ocr` table) — nothing further
+needed here.
 
 ## Landmark matching — proximity component (DONE, 2026-08)
 
@@ -161,148 +168,171 @@ deprecated and due for removal in the release after the one this project
 pins (`2026-07-22.0`) — built against `taxonomy`/`basic_category` from the
 start, not the deprecated field.
 
-## Landmark matching — DINOv3 implementation progress (2026-08)
+## Landmark matching — DINOv3 (DONE, 2026-08/09)
 
 **Design (still holding):** visual recognition (DINOv3) and geospatial
 proximity (`overture_landmarks.py`, done above) are genuinely complementary,
 not primary+fallback — catches landmarks a photo has no useful GPS for,
 lesser-known landmarks outside any fixed vocabulary, and tightly-cropped
-photos. A future search-agent query should consult both sources, not prefer
-one.
+photos. The search agent now consults both (see the two-SQL-tool design
+below), not one in preference to the other.
 
 **Model: DINOv3 ViT-S+** (`facebook/dinov3-vits16plus-pretrain-lvd1689m`,
-~29M params) — chosen over DELF/DELG (older, TensorFlow) after live
-benchmark research; PyTorch-native, fits the `inference-service` task
-registry. **Gated model** — required a HuggingFace license application
-(approved this session, turnaround was about a day).
+~29M params), gated on HuggingFace (license approved 2026-08).
 
-**Reference dataset: GLDv2-clean, full set, no compromise on quality.**
-Explicitly chosen over a small hand-curated list after discussion — "as
-open and agnostic as possible" was the stated priority, and GLDv2-clean
-(the noise-filtered subset researchers actually use for this task, not the
-noisier raw 5M/200k-label full set) is the right *quality* choice too, not
-just a scope compromise. **1,580,470 images, 81,313 landmarks** — confirmed
-exact match against the dataset's own documented stats after both the
-download and the embedding run completed with zero discrepancy.
+**Reference dataset: GLDv2-clean, full set** — 1,580,470 images, 81,313
+landmarks, embedded and stored on the NAS at
+`/Docker/gpu-ml/landmark-embeddings/` (an NFS-backed Docker volume,
+`gpu_ml_landmark_embeddings`, following the household's standard NAS
+volume convention — see `flask-app-template/README.md`).
 
-**What's actually built and working, in order:**
+**Pipeline (all done):**
+1. `gpu-ml/landmark-reference/download_gldv2_clean.py` — downloaded the
+   clean subset.
+2. `gpu-ml/inference-service/tasks/embed_image.py` — generic DINOv3
+   embedding task, exposes a reusable `.embed()` shared with `match_landmark`.
+3. `gpu-ml/landmark-reference/embed_reference_set.py` — bulk-embedded all
+   1.58M images.
+4. NFS volume set up, embeddings copied over (WinSCP).
+5. `gpu-ml/inference-service/tasks/match_landmark.py` — cosine similarity
+   against the reference matrix. `min_similarity` (default 0.7) and `top_k`
+   are per-call `params`, not hardcoded — added so a diagnostic caller
+   could probe below-default candidates without a code change.
+6. `sidecar/landmark_labels.py` — `landmark_id` → display-name lookup
+   (GLDv2's `train_label_to_hierarchical.csv`, stored durably on the same
+   NAS folder). **Real, confirmed data gap:** a meaningful number of GLDv2
+   IDs have thin/missing/non-English category names — these fall back to a
+   bare `landmark <id>` placeholder even when the match itself is correct.
+   This is a naming problem, not a matching-accuracy problem — see
+   "Landmark name overrides" below for the planned fix.
+7. **Calibration test, DONE:** `sidecar/dinov3_landmark_report.py` (a
+   diagnostic script, writes no sidecar DB rows) ran 500 real Disney World
+   photos, stratified-sampled across the full date range, at
+   `--min-similarity 0.4` specifically to see below-default candidates.
+   Findings: **`min_similarity = 0.7` confirmed as a good cutoff** (real
+   negatives mostly scored below it, real positives mostly above), **a
+   meaningful number of real high-confidence correct matches occurred**
+   (the approach has real value), and the landmark-name gap (point 6)
+   surfaced repeatedly.
+8. **`sidecar/enrichment/dinov3_landmarks.py` — the real enrichment
+   client, BUILT (2026-09).** Candidate scope: all real image assets
+   EXCEPT ones `overture_landmarks` already matched (`source =
+   'overture_places'` in `landmark_matches`) — this single condition
+   covers both no-coordinate photos and coordinate photos where proximity
+   search came up empty, without two separate query branches. Stores
+   `landmark_id` alongside `landmark_name` (see schema note below) and
+   `top_k=1` per photo (unlike the diagnostic report's `top_k=5` — for a
+   *stored* row, the single best visual match is what's meaningful).
+   `sidecar/run_dinov3_landmarks.py` is the entry point. **Not yet run at
+   `--scope full`** — see "Next steps."
 
-1. ✅ **`gpu-ml/landmark-reference/download_gldv2_clean.py`** — downloads
-   GLDv2's raw `train` shards (500 tars, ~500GB total transfer) and
-   selectively extracts only the ~1.58M clean-subset images, streaming one
-   shard at a time (never holding the full 500GB on disk at once), resumable
-   via `.done` markers per shard. **RUN AND COMPLETE.** Output:
-   `/media/sdb1/gldv2-clean/images/*.jpg` + `manifest.csv` (image_id,
-   landmark_id, local_path) on the gpu-ml host (NOT in Docker — gpu-ml also
-   serves as the household NAS, `/media/sdb1` is one of its drives, chosen
-   for available space at decision time).
-2. ✅ **`gpu-ml/inference-service/tasks/embed_image.py`** — generic,
-   NOT landmark-specific image-embedding HTTP task (`POST
-   /v1/infer/embed_image`), registered in `tasks/__init__.py`. Requires
-   `HF_TOKEN` (HuggingFace access token, gated-model download) as an env var
-   on the container, wired via `docker-compose.yml`. **BUILT, TESTED LIVE**
-   — a real curl call returned a genuine 384-dim embedding vector. Refactored
-   this session to expose a reusable `.embed(image) -> np.ndarray` method
-   (not just the HTTP-facing `.infer()`) specifically so a future matching
-   task can share this same loaded model instance rather than loading a
-   second copy of DINOv3 into the shared 6GB VRAM budget.
-3. ✅ **`gpu-ml/landmark-reference/embed_reference_set.py`** — bulk-embeds
-   all 1.58M reference images, batched (64 images per GPU forward pass, not
-   one HTTP call per image — the right tool for a one-time job at this
-   scale, chosen deliberately over reusing the per-image HTTP task for this
-   step). Chunked (50,000 images/chunk, ~32 chunks) + resumable, same
-   `.done`-marker pattern as the download script. **RUN AND COMPLETE** —
-   `using CUDA` confirmed in the log (not a CPU fallback), all 1,580,470
-   images embedded with zero drops. Output: `chunk_NNNN.npy` (embeddings) +
-   `chunk_NNNN.csv` (image_id, landmark_id) pairs at
-   `/media/sdb1/gldv2-clean/embeddings/` on the gpu-ml host — **~2.4GB
-   total.**
-   - Real dependency gap hit and fixed along the way: `transformers`'
-     `AutoImageProcessor` needs `torchvision` (not just `torch`) as a
-     backend — wasn't in this standalone venv's `requirements.txt` (the
-     Docker container never hit this because `ultralytics`, installed there
-     for `object_detect`, pulls `torchvision` in transitively). Pinned
-     `torchvision==0.20.1` per PyTorch's own official compatibility table
-     for `torch==2.5.1`.
-4. ✅ **Volume-mount/NAS-access question — RESOLVED (2026-08).** The
-   reference embeddings live on gpu-ml's host filesystem
-   (`/media/sdb1/gldv2-clean/embeddings/`, computed outside Docker), and
-   `inference-service` needs a way to see that path. **Decision: an
-   NFS-backed Docker volume, not a host bind mount** — matching
-   `photo-search/docker-compose.yml`'s existing `immich_upload` pattern
-   exactly (`driver_opts: {type: nfs, device: ..., addr: ...}`).
+**Schema:** `landmark_matches.source`, `.distance_meters`, and
+`.landmark_id` columns all exist (via `ensure_schema.py`). `landmark_id`
+was added specifically because `landmark_name` is the field the planned
+name-overrides tool will let a user manually correct — `landmark_id` is
+GLDv2's own stable identifier and won't change under an override, so it's
+the right thing to group/cluster on, not the name.
 
-   Rationale, for the record: gpu-ml's `inference-service` container
-   currently happens to run on the same host as the embeddings (gpu-ml is
-   also the household NAS), which would make a plain bind mount work today.
-   But the household's whole Docker architecture is built around containers
-   being mobile/reproducible from compose + an optional Dockerfile, with a
-   single consistent NAS-access pattern deliberately preferred over
-   host-specific bind mounts — one location to troubleshoot instead of a
-   different access method per container. Same-host-today doesn't guarantee
-   same-host-always, so the NFS volume is the correct choice even though it
-   adds a network hop the bind mount wouldn't have needed right now.
+## Landmark name overrides — planned, not yet built (2026-09)
 
-   Implemented in `gpu-ml/docker-compose.yml`'s new `landmark_embeddings`
-   volume (mounted read-only at `/reference-embeddings` in
-   `inference-service`) and documented in `gpu-ml/.env.example`
-   (`NAS_IP`, `NAS_LANDMARK_EMBEDDINGS_PATH`).
+New tool, scoped after the real-data test above. Purpose: turn the
+`landmark <id>` fallback gap into a usable name, using the model's own
+consistency across the library as the signal, rather than depending on
+GLDv2's sparse metadata.
 
-   **Still outstanding, blocking a real end-to-end test:** the actual NFS
-   export itself has not been set up on the NAS side yet (e.g. via
-   `/etc/exports` on gpu-ml, pointing at
-   `/media/sdb1/gldv2-clean/embeddings`) — this is a host/sysadmin step, not
-   a code change, and hasn't been done. Until it exists, the
-   `landmark_embeddings` volume will fail to mount.
+**Planned shape:**
+- Group DINOv3-matched photos by `landmark_id` (now a real column — see
+  schema note above).
+- Simple review interface: for each cluster, show the matched photos
+  together so it's visually obvious whether the model is consistently
+  matching the same real-world thing.
+- Let the user manually assign/correct a name where it is.
+- Store overrides in a small local table (tentatively
+  `landmark_name_overrides`, keyed on `landmark_id`) — checked first,
+  falling back to the GLDv2 CSV name (or the numeric ID) only if no
+  override exists. Never touches GLDv2's own data.
 
-5. ✅ **`gpu-ml/inference-service/tasks/match_landmark.py`** — scaffolded
-   this session. Takes a query image, embeds it via the *shared*
-   `EmbedImageTask.embed()` (registered together in `tasks/__init__.py`),
-   L2-normalizes and loads the reference chunks lazily from
-   `/reference-embeddings`, computes cosine similarity via a single dot
-   product against the pre-normalized reference matrix, returns top-k
-   matches as `{"landmark_id": str, "similarity": float}`. **NOT YET
-   TESTED** — blocked on the NFS export above; no real query has been run
-   against the loaded reference matrix yet.
+**Deliberately scoped for AFTER the full-collection DINOv3 pass** (see
+Next steps below) — clustering needs enough real match data across the
+whole library to be worth reviewing.
 
-   Also still open, deferred until real testing is possible:
-   - **Landmark ID → name mapping.** GLDv2 only labels images with a numeric
-     `landmark_id`; there's no clean name in the dataset itself. Confirmed
-     via the dataset's own repo: `train_label_to_category.csv`
-     (`https://s3.amazonaws.com/google-landmark/metadata/train_label_to_category.csv`,
-     landmark_id → a Wikimedia Commons category URL) is the real source —
-     not yet downloaded/parsed. `match_landmark.py` currently returns the
-     raw numeric `landmark_id` only. Plan: derive a rough display name from
-     the URL's trailing path segment (e.g. `.../Category:Eiffel_Tower` →
-     "Eiffel Tower") — a commonly-used approach for this exact dataset, but
-     a rough parse, not a curated name; expect some odd-looking results.
-   - **Similarity threshold and top-k.** `MIN_SIMILARITY = 0.7` in
-     `match_landmark.py` is an unvalidated starting guess — same
-     "unvalidated starting guess, revisit with real data" situation as
-     `overture_landmarks.py`'s `MIN_CONFIDENCE`/`MAX_DISTANCE_METERS` were
-     before real testing.
-   - **`sidecar/enrichment/dinov3_landmarks.py`** (the actual sidecar-side
-     enrichment client) hasn't been started at all yet. Candidate scope,
-     already agreed: always include no-coordinate photos (untouched by
-     `overture_landmarks`) + coordinate photos where `overture_landmarks`
-     found zero matches; deprioritize/skip photos that already got a
-     proximity match.
+## Wiring the side-car into the search agent (DONE, 2026-09)
 
-**Schema:** `landmark_matches.source` and `.distance_meters` columns exist
-(added via `ensure_schema.py`, see above) — `distance_meters` will be `NULL`
-for `source='dinov3_visual'` rows, same pattern as `resolved_geo.county`
-being `NULL` for the `immich_reverse_geocode` source.
+**The problem:** Immich's database and the sidecar database are
+deliberately separate Postgres databases (see "Core design decisions" —
+schema-stability isolation was the whole point). Standard Postgres cannot
+`JOIN` across databases in a single query, so simply adding sidecar tables
+to `run_readonly_sql`'s existing allowlist doesn't work — that tool
+connects to Immich's database only.
+
+**Two options considered:**
+- **`postgres_fdw`** (foreign data wrapper) — would let one query `JOIN`
+  across both databases, but requires foreign-table definitions and grants
+  spanning both databases, quietly eroding the isolation the split was
+  built for.
+- **A second, independent SQL tool** — reached instead. `run_readonly_sql`
+  gains a sibling, `run_readonly_sidecar_sql`, pointed at the sidecar
+  database, and the two are composed at the AGENT level via
+  `combine_results` (which already existed for exactly this kind of set
+  composition — it operates on handles regardless of which tool produced
+  them). **Chosen** — reuses machinery already built rather than inventing
+  cross-database plumbing, and keeps the two databases genuinely isolated.
+
+**What changed, concretely:**
+- **`search-api/sql_tool.py` refactored into a DB-agnostic factory**,
+  `make_readonly_sql_tool(tool_name, description, schema_prompt,
+  dsn_config_attr)`. All the actual mechanics (SQL generation via
+  `SQL_MODEL`, single-SELECT verification, statement timeout, row cap,
+  handle-vs-inline-rows routing) are shared code, parameterized only by
+  which database/DSN and which schema-description prompt to use. Two
+  instances now exist: `RUN_READONLY_SQL_SCHEMA`/`execute_run_readonly_sql`
+  (Immich, unchanged names — nothing importing these needed to change) and
+  the new `RUN_READONLY_SIDECAR_SQL_SCHEMA`/`execute_run_readonly_sidecar_sql`
+  (sidecar). This DB-agnostic shape is deliberate for future growth — a
+  third database later would be a third factory call, not new mechanics.
+- **`sql/create_sidecar_readonly_role.sql`** — new, mirrors
+  `create_readonly_role.sql`'s allowlist approach against the sidecar
+  database. Grants `SELECT` on `landmark_matches`, `object_counts`,
+  `resolved_geo` only — `enrichment_status` deliberately excluded (internal
+  bookkeeping, not search-relevant, and its `error_detail` strings
+  shouldn't be agent-readable).
+- **`search-api/config.py`** — new `SIDECAR_SQL_READONLY_DSN` (empty by
+  default) and `AGENT_SIDECAR_SQL_ENABLED` (`false` by default). Both
+  unset on production `search-api` — sidecar-blindness there is now
+  enforced purely by config absence, the same mechanism that already kept
+  it sidecar-blind, not a special-cased code path.
+- **`search-api/tools.py`** — `build_tool_schemas()` gained an
+  `include_sidecar_sql` parameter, independent of `include_sql`.
+  `combine_results` itself needed NO changes — it already worked on
+  arbitrary handles.
+- **`search-api/search_agent.py`** — the executors map and system prompt
+  both updated: the agent is told to use `run_readonly_sidecar_sql` for a
+  named landmark, an object count, or county-level location, and — when a
+  query needs both a sidecar fact and an Immich fact (e.g. "Kevin's photos
+  of the Eiffel Tower") — to run one query against each database and
+  combine the two handles with `combine_results`, never to attempt both in
+  a single request to either tool.
+
+**Promoting to production later** (once `sidecar_prod` exists): re-run
+`create_sidecar_readonly_role.sql` against `sidecar_prod`, set
+`SIDECAR_SQL_READONLY_DSN` and `AGENT_SIDECAR_SQL_ENABLED=true` on
+production `search-api`'s environment. No code change — this was the
+explicit point of the DB-agnostic factory design.
+
+**Not yet done:** re-running the structured test list (README) against
+queries that actually exercise `run_readonly_sidecar_sql` and the
+cross-database `combine_results` pattern — this has been wired but not
+yet validated against real test queries.
 
 ## Schema evolution tooling (DONE, 2026-08)
 
 `sidecar/db.py`'s `ensure_column()`/`ensure_table()` + `sidecar/ensure_schema.py`
-— see "Implementation status" above. Already dogfooded twice (`landmark_matches.source`,
-then `.distance_meters`).
+— see "Implementation status" above. Dogfooded three times now
+(`landmark_matches.source`, `.distance_meters`, `.landmark_id`).
 
 ## Future enrichment candidates (2026-08)
 
-Two accepted for the roadmap, not yet built (after DINOv3 landmark matching
-is finished):
+Two accepted for the roadmap, not yet built:
 
 - **Audio-to-text for videos** — model chosen: **`faster-whisper`** (an
   optimized reimplementation of OpenAI's Whisper, ~4x faster with lower
@@ -329,6 +359,9 @@ is finished):
   - Minor, non-blocking note: YOLO-World inherits Ultralytics' GPL-3.0
     license (mainly a concern for redistributing a proprietary product, not
     for this self-hosted personal tool); Florence-2 is MIT.
+- **Landmark name overrides** — see its own section above; scoped after the
+  full-collection DINOv3 pass, not a from-scratch future idea but also not
+  yet built.
 - *(Add more here as they come up, rather than letting them live only in
   chat history.)*
 
@@ -336,39 +369,55 @@ is finished):
 
 The gpu-ml box's GTX 1060 has 6GB VRAM shared across `immich-machine-learning`,
 `ollama`, and now `inference-service` (which itself hosts both YOLO-World and
-DINOv3 as separate tasks in one process). Confirmed working for `object_detect`
-and `embed_image` individually (single worker, lazy model loading per task —
-see `gpu-ml/README.md`'s VRAM contention note). **Not yet tested: both
-YOLO-World and DINOv3 loaded simultaneously in the same container under real
-concurrent load** — worth watching once the matching task is live and both
-tasks might realistically be invoked close together in time.
+DINOv3 as separate tasks in one process). Confirmed working for `object_detect`,
+`embed_image`, and `match_landmark` individually (single worker, lazy model
+loading per task — see `gpu-ml/README.md`'s VRAM contention note). **Not yet
+tested: YOLO-World and DINOv3 loaded and actively inferring at the same
+time** — worth watching once `dinov3_landmarks.py` runs at `--scope full`
+and could realistically overlap with an `object_detect` pass.
 
-## Process & infrastructure decisions (2026-07/08, still holding)
+## Process & infrastructure decisions (2026-07/09, still holding)
 
 - **Two containers.** `search-api` (prod) stays completely sidecar-blind —
-  no dependency on the sidecar code or DB. `search-api-dev` (same
+  no dependency on the sidecar code or DB, and now also no
+  `SIDECAR_SQL_READONLY_DSN`/`AGENT_SIDECAR_SQL_ENABLED` set (see "Wiring
+  the side-car into the search agent"). `search-api-dev` (same
   image/codebase, different config + a superset build via
-  `sidecar/Dockerfile.dev`) is where sidecar integration is built and tested.
+  `sidecar/Dockerfile.dev`) is where sidecar integration is built and
+  tested, and — as of this session — the only place the sidecar SQL tool
+  is enabled. **Deliberately staying split for a while longer** — the
+  DB-agnostic SQL-tool factory exists specifically so promoting to
+  production later is a config change, not a rebuild.
 - **Sidecar databases: separate Postgres databases, both dev and prod, on
   the same Postgres instance as Immich's own DB.**
   - **Dev (`sidecar_dev`):** no backup. Wipe-and-redevelop freely — live now,
     populated with real test data.
   - **Prod (`sidecar_prod`, not yet built):** will need its own backup
     mechanism.
+- **Cross-database queries: two separate SQL tools + `combine_results`,
+  never `postgres_fdw`.** See "Wiring the side-car into the search agent"
+  for the full reasoning — this is now the established pattern for any
+  future case where the agent needs to correlate data across genuinely
+  separate databases.
 - **Repo layout.** `sidecar/` is a top-level folder, sibling to `search-api/`.
   `gpu-ml` is its own separate repo, one device serving multiple projects —
-  and, as of this session, also confirmed to be the household NAS (multiple
-  large drives mounted at `/media/*`), which matters for where large
-  datasets/models should live and how containers should access them.
+  and also confirmed to be the household NAS (multiple large drives
+  mounted at `/media/*`), which matters for where large datasets/models
+  should live and how containers should access them.
 - **NAS access: NFS-backed Docker volumes, always, even for same-host
-  cases.** Confirmed as a deliberate, general household policy (not just a
-  one-off for landmark embeddings): the whole Docker architecture is built
-  on containers being mobile/reproducible from compose, so one consistent
-  NAS-access mechanism is preferred over deciding per-container whether a
-  bind mount would technically work today. See "Landmark matching — DINOv3
-  implementation progress" above for the concrete case this was decided on.
+  cases.** Confirmed as a deliberate, general household policy: the whole
+  Docker architecture is built on containers being mobile/reproducible
+  from compose, so one consistent NAS-access mechanism is preferred over
+  deciding per-container whether a bind mount would technically work
+  today. **Standard NAS volume convention** (see
+  `flask-app-template/README.md`): `{appname}_{purpose}` volume naming,
+  device path hardcoded directly in `docker-compose.yml`, only `NAS_IP`
+  env-driven with a fallback default. The `gpu_ml_landmark_embeddings`
+  volume follows this exactly, including being mounted a second time (once
+  read-only from gpu-ml, once read-write from photo-search) rather than
+  duplicating the underlying data.
 - **Schema shape.** Per-tool typed tables, not EAV — proven correct in
-  practice across four real enrichment tools now.
+  practice across all four enrichment tools now.
 - **UUID stability caveat.** Immich UUIDs are not move-proof. Policy:
   reaugment under the new UUID when it appears; dead duplicates cleaned up
   via Immich's own "Remove offline files" job.
@@ -376,55 +425,63 @@ tasks might realistically be invoked close together in time.
   in `sidecar.test_set` — live now, includes the original 5 geocode hard
   cases (2 resolved, 3 correctly-null-in-wilderness) plus a multi-face photo.
 
-## Next steps (2026-08, latest)
+## Next steps (2026-09, latest)
 
-1. ✅ **Resolve the volume-mount/NAS-access question** — done, see
-   "Landmark matching — DINOv3 implementation progress" above. NFS-backed
-   Docker volume, matching `immich_upload`.
-2. **Set up the actual NFS export on the NAS side** (e.g. `/etc/exports` on
-   gpu-ml, pointing at `/media/sdb1/gldv2-clean/embeddings`) — a host
-   config step, not code, and the current hard blocker on testing anything
-   below. `gpu-ml/.env.example`'s `NAS_LANDMARK_EMBEDDINGS_PATH` documents
-   the expected export path.
-3. **Test `match_landmark.py` end-to-end** against the pinned test set once
-   the export exists — expect real surprises in match quality/threshold,
-   same as `overture_landmarks.py`'s category-noise discovery. Calibrate
-   `MIN_SIMILARITY` and `DEFAULT_TOP_K` against real results.
-4. **Build `sidecar/enrichment/dinov3_landmarks.py`** — the client side,
-   same shape as the other enrichment tools; candidate scope already agreed
-   (see above).
-5. **Wire the side-car into the search agent** — still not started. Extend
-   `run_readonly_sql`'s readable allowlist (or add structured filters) so
-   `resolved_geo`/`object_counts`/`landmark_matches` are queryable. Explicitly
-   deferred until the enrichment tools themselves were proven — three of
-   four planned tables are there now, the fourth (DINOv3 landmarks) close.
-6. **Run the full-library pass** (`--scope full`) for whichever enrichments
-   are trusted — still deferred until the search agent can actually use the
-   data, so there's a real payoff to point at before spending the batch time.
-7. **Audio-to-text (`faster-whisper`) and scene captioning (Florence-2)** —
+1. ✅ **Resolve the volume-mount/NAS-access question** — done.
+2. ✅ **Set up the actual NFS export on the NAS side** — done.
+3. ✅ **Test `match_landmark.py` end-to-end** — done, against 500 real
+   photos. `min_similarity = 0.7` confirmed as a good cutoff.
+4. ✅ **Build `sidecar/enrichment/dinov3_landmarks.py`** — done. Not yet
+   run at `--scope full` (see 6 below).
+5. ✅ **Wire the side-car into the search agent** — done, see "Wiring the
+   side-car into the search agent" above. Dev-only for now.
+6. **Run the full-library pass** (`--scope full`) for `dinov3_landmarks.py`
+   specifically (the other three enrichments' full-library status should
+   be double-checked too) — this is also the prerequisite for the
+   landmark-name-overrides tool (needs a full library's worth of matches
+   to usefully cluster).
+7. **Re-run the structured test list against `run_readonly_sidecar_sql`
+   and cross-database `combine_results` queries** — the wiring exists but
+   hasn't been validated against real test queries yet (e.g. "photos of
+   the Eiffel Tower", "Kevin's photos with 3+ dogs").
+8. **Build the landmark name overrides tool** — see its own section above.
+   Scoped for after the full-collection pass (6).
+9. **Audio-to-text (`faster-whisper`) and scene captioning (Florence-2)** —
    accepted future candidates, not yet started, come after the above.
 
 ## Pointers into existing code/docs
 
 - Main `photo-search/README.md` — full project snapshot, the search-agent design.
-- `search-api/sql_tool.py` — the read-only SQL tool + dedicated Postgres role;
-  the model for how the agent will query the side-car once wired in.
-- `search-api/tools.py` — `search_photos` filters (people/cities match modes);
-  where structured augmentation filters could be added.
+- `search-api/sql_tool.py` — `make_readonly_sql_tool()`, the DB-agnostic
+  factory, plus its two instances (`run_readonly_sql` for Immich,
+  `run_readonly_sidecar_sql` for the sidecar database).
+- `sql/create_readonly_role.sql` / `sql/create_sidecar_readonly_role.sql` —
+  the dedicated read-only Postgres roles, one per database.
+- `search-api/tools.py` — `search_photos` filters (people/cities match
+  modes), `combine_results` (the cross-tool/cross-database composition
+  mechanism), `build_tool_schemas()`.
+- `search-api/search_agent.py` — the agent loop and system prompt,
+  including when to use `run_readonly_sidecar_sql` vs. `run_readonly_sql`.
 - `search-api/landmark/` — the existing curated CLIP-embedding landmark
-  matcher that DINOv3 visual matching would layer onto, not replace.
+  matcher that DINOv3 visual matching layers onto, not replaces.
 - `gpu-ml/` — the shared GPU device (own repo; also the household NAS).
   `gpu-ml/inference-service/` — the generic task-registry inference
   protocol (`object_detect`, `embed_image`, `match_landmark`).
   `gpu-ml/landmark-reference/` — one-off batch scripts
   (`download_gldv2_clean.py`, `embed_reference_set.py`), run directly on the
   host in a venv, not through Docker. `gpu-ml/.env.example` — documents
-  `HF_TOKEN`, `NAS_IP`, `NAS_LANDMARK_EMBEDDINGS_PATH`.
+  `HF_TOKEN`, `NAS_IP`.
 - `sidecar/` — the side-car codebase: `migrations/`, `db.py`
   (incl. `ensure_column`/`ensure_table`), `config.py`, `ensure_schema.py`,
-  `test_set.py`, `populate_test_set.py`, `enrichment/` (`reverse_geocode.py`,
-  `overture_geocode.py`, `object_detect.py`, `overture_landmarks.py`;
-  `dinov3_landmarks.py` not yet created), `run_*.py` entry points,
+  `test_set.py`, `populate_test_set.py`, `landmark_labels.py` (shared
+  landmark_id → name lookup), `enrichment/` (`reverse_geocode.py`,
+  `overture_geocode.py`, `object_detect.py`, `overture_landmarks.py`,
+  `dinov3_landmarks.py`), `dinov3_landmark_report.py` (diagnostic HTML
+  report, not a formal enrichment tool), `run_*.py` entry points,
   `spike_overture_schema.py` / `spike_overture_places_schema.py`
   (schema-verification pattern, reuse if a third Overture theme is ever
   needed).
+- `flask-app-template/README.md` — the household's standard NAS volume
+  convention (`{appname}_{purpose}` naming, hardcoded device paths,
+  `NAS_IP`-only env parameterization), followed by
+  `gpu_ml_landmark_embeddings`.
