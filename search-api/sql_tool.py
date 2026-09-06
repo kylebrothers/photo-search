@@ -52,14 +52,22 @@ Dual-path result handling (reference-based, see tools.py):
 Model split: SQL generation uses a SEPARATE Claude call with SQL_MODEL, not
 the orchestration model, for both instances — see config.py.
 
-Ordering matters for the sidecar tool specifically (added 2026-09): when a
-sidecar photo-set handle becomes combine_results' base_handle in a union
-with a CLIP search_photos handle (see search_agent.py's "STRUCTURED DATA
-BEATS FUZZY VISUAL SIMILARITY" principle), the union's ordering follows
-base_handle's ordering first — so the sidecar SQL-generation prompt
-instructs the model to ORDER BY confidence DESC on landmark/object-count
-lookups, putting the strongest structured matches first in the combined
-result rather than in whatever order Postgres happens to return them.
+Automatic CLIP pairing for the sidecar tool (added 2026-09):
+execute_run_readonly_sidecar_sql (near the bottom of this file) wraps the
+raw sidecar executor and automatically ALSO runs search_photos (CLIP),
+then unions the two with the sidecar handle as base — the model just
+calls one tool and gets one already-combined handle back. This replaced
+relying on the orchestrating model to remember a three-step dance (sidecar
+query, then search_photos, then combine_results) after live testing
+showed Haiku did not reliably do this even with an explicit, prominently-
+placed prompt instruction: one test skipped the union step, a separate
+test skipped search_photos entirely. Moving the pairing into code removes
+the sequencing decision from the model for this specific case — there is
+no step left to skip. AGENT_MODEL was also escalated to Sonnet for the
+same underlying finding (see config.py) — the two fixes are complementary,
+not redundant: Sonnet may well sequence this correctly on its own, but the
+code-level fix is the more robust guarantee and costs little to keep even
+if Sonnet turns out not to need it.
 """
 
 import logging
@@ -69,6 +77,7 @@ import psycopg2
 import psycopg2.extras
 
 import config
+import tools as tools_mod
 
 logger = logging.getLogger(__name__)
 
@@ -386,9 +395,9 @@ combine_results at the agent level, not by this tool.
 {row_cap} rows).
 - For a PHOTO-set query, ORDER BY the relevant quality signal DESCENDING \
 (confidence for landmark_matches, count for object_counts) so the strongest \
-matches come first — this ordering is preserved when the caller later unions \
-this result with a broader CLIP search, putting your best matches at the \
-front of the combined list.
+matches come first — this ordering is preserved when this tool automatically \
+pairs your result with a broader CLIP search (see the calling code — you do \
+not need to do anything else for this pairing to happen).
 
 Two kinds of query — pick by what the request asks for:
 - If the request wants a SET OF PHOTOS, select the id column exactly as \
@@ -447,7 +456,7 @@ specific quantity (e.g. "3 or more dogs" -> count >= 3). ORDER BY count DESC.
 resolved_geo.county exists here but not in the main database — useful when \
 a request needs finer granularity than city/state/country alone provides."""
 
-RUN_READONLY_SIDECAR_SQL_SCHEMA, execute_run_readonly_sidecar_sql = make_readonly_sql_tool(
+RUN_READONLY_SIDECAR_SQL_SCHEMA, _execute_run_readonly_sidecar_sql_raw = make_readonly_sql_tool(
     tool_name="run_readonly_sidecar_sql",
     description=(
         "Run a read-only query against the photo library's SIDE-CAR "
@@ -458,18 +467,95 @@ RUN_READONLY_SIDECAR_SQL_SCHEMA, execute_run_readonly_sidecar_sql = make_readonl
         "data including county (resolved_geo). Use this when a request "
         "needs one of THOSE specific kinds of fact — a named landmark, an "
         "object count, a county — that search_photos and run_readonly_sql "
-        "can't express. IMPORTANT: for a named landmark or object count, "
-        "this does NOT replace search_photos — run BOTH (see the agent's "
-        "system prompt, 'STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY') "
-        "and combine them with combine_results, mode='union', this tool's "
-        "handle as base_handle. This is a genuinely SEPARATE database from "
-        "run_readonly_sql's; it cannot be joined against the main database "
-        "in one query. If a request needs BOTH a sidecar fact AND a "
-        "main-database fact (e.g. a specific person AND a landmark), run "
-        "each as its own query and combine the two handles with "
+        "can't express. This tool AUTOMATICALLY also runs a broader CLIP "
+        "search and unions it in — you do NOT need to separately call "
+        "search_photos or combine_results for this; just call this tool "
+        "and use the single handle it returns. This IS a genuinely "
+        "SEPARATE database from run_readonly_sql's, though — it cannot be "
+        "joined against the main database in one query. If a request needs "
+        "BOTH a sidecar fact AND a main-database fact (e.g. a specific "
+        "person AND a landmark), run each as its own query (this tool for "
+        "the sidecar part, run_readonly_sql/search_photos for the "
+        "main-database part) and combine the two handles yourself with "
         "combine_results. Returns a handle + count for a photo set, or "
         "inline rows for a value lookup. Never use it to modify data."
     ),
     schema_prompt=_SIDECAR_SQL_SYSTEM_PROMPT,
     dsn_config_attr="SIDECAR_SQL_READONLY_DSN",
 )
+
+
+def execute_run_readonly_sidecar_sql(store, request, claude_client, immich=None, original_query=None):
+    """
+    Wraps _execute_run_readonly_sidecar_sql_raw with automatic CLIP pairing
+    — see this module's docstring, "Automatic CLIP pairing," for the full
+    story of why this exists (a confirmed, repeated model-sequencing
+    failure, not a hypothetical concern).
+
+    immich, original_query: supplied by search_agent.py's executor closure
+    (see run_search_agent) — NOT part of the tool's schema, so the model
+    never sees or provides these; it still only ever passes `request`.
+    If either is omitted, falls back to the raw sidecar-only result with
+    no pairing attempted — lets this function be called in a context that
+    doesn't have an ImmichClient/original query handy without crashing.
+
+    Behavior:
+    - Raw call errors (e.g. a DB connection problem): if immich/
+      original_query are available, fall back to a CLIP-only result rather
+      than a dead end for the model, with a `note` explaining why. This is
+      the same graceful degradation seen happening via the MODEL's own
+      judgment during a real DSN-misconfiguration incident before this
+      code-level fallback existed — now guaranteed rather than incidental.
+    - Raw call returns a VALUE lookup (inline `rows`, no `handle`): passed
+      through unchanged. Union only makes sense for photo sets.
+    - Raw call returns a photo-set `handle`: automatically also runs
+      search_photos(object_query=original_query), then
+      combine_results(mode='union', base_handle=<sidecar>) so the sidecar's
+      confirmed, precisely-ordered matches (see _SIDECAR_SQL_SYSTEM_PROMPT's
+      ORDER BY guidance) land first, with CLIP's broader recall appended.
+    """
+    raw_result = _execute_run_readonly_sidecar_sql_raw(store, request, claude_client)
+
+    if immich is None or original_query is None:
+        return raw_result
+
+    if raw_result.get("error"):
+        clip_result = tools_mod.execute_search_photos(immich, store, object_query=original_query)
+        logger.info(
+            f"run_readonly_sidecar_sql: raw call failed ({raw_result['error']}); "
+            f"fell back to CLIP-only ({clip_result['count']} result(s))"
+        )
+        return {
+            **clip_result,
+            "note": (
+                f"sidecar query failed ({raw_result['error']}); "
+                f"returned CLIP-only results instead"
+            ),
+        }
+
+    if "handle" not in raw_result:
+        # A VALUE lookup — nothing to union.
+        return raw_result
+
+    clip_result = tools_mod.execute_search_photos(immich, store, object_query=original_query)
+    combined = tools_mod.execute_combine_results(
+        store,
+        base_handle=raw_result["handle"],
+        filter_handles=[clip_result["handle"]],
+        mode="union",
+    )
+    logger.info(
+        f"run_readonly_sidecar_sql: auto-paired {raw_result['count']} sidecar "
+        f"match(es) with {clip_result['count']} CLIP result(s) -> "
+        f"{combined['handle']} ({combined['count']})"
+    )
+    return {
+        "sql": raw_result.get("sql"),
+        "handle": combined["handle"],
+        "count": combined["count"],
+        "note": (
+            f"automatically paired with a CLIP search for broader recall — "
+            f"{raw_result['count']} confirmed structured match(es) listed "
+            f"first, {clip_result['count']} additional CLIP result(s) after"
+        ),
+    }

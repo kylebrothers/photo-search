@@ -10,8 +10,10 @@ Design decisions (see README "Agreed design going forward"):
   - Model pinned via env (AGENT_MODEL), NOT auto-"latest" — SQL/tool
     correctness is prompt-sensitive, so model moves are deliberate.
   - AGENT_MODEL and SQL_MODEL are separate env vars; the SQL step's model can
-    be escalated (Haiku -> Sonnet) independently of the orchestrator. The SQL
-    call is made in sql_tool.py with SQL_MODEL; this loop uses AGENT_MODEL.
+    be escalated independently of the orchestrator. The SQL call is made in
+    sql_tool.py with SQL_MODEL; this loop uses AGENT_MODEL. AGENT_MODEL is
+    now Sonnet (escalated 2026-09) — see config.py's comment for the
+    confirmed live failures that motivated this.
   - Loop bounds: hard turn cap AND a wall-clock timeout independent of
     Gunicorn's --timeout (must fire before Gunicorn kills the worker).
   - On total failure (API error, timeout, truncation, no finalize), fall back
@@ -36,24 +38,26 @@ query. AGENT_SIDECAR_SQL_ENABLED defaults to false; only search-api-dev
 sets it true today (search-api stays sidecar-blind by config absence, same
 as always).
 
-Real failure found and fixed 2026-09: a landmark-specific bullet buried
-among several other "How to work" bullets was NOT enough to reliably get
-Haiku to call run_readonly_sidecar_sql at all — a live test of "photos of
-the Eiffel Tower" used ONLY search_photos (CLIP) and returned CLIP's
-generic 100-result page, never touching the sidecar. Fixed by promoting
-the underlying idea to a standalone, prominently-placed principle
-("Structured data beats fuzzy visual similarity") stated once, generally,
-rather than a growing list of per-case rules (landmarks today, counts and
-counties already, more later) — a general principle should generalize to
-future sidecar enrichments without another prompt edit, though it is
-NOT proven to be more reliably followed than the specific rule that just
-failed; this is a real, acknowledged trade-off, and worth confirming with
-the structured test list (README) rather than assuming it worked from a
-single example. When it fires correctly, search_photos and the relevant
-structured tool BOTH run, combined via combine_results(mode='union',
-base_handle=<structured>) — this is genuine promotion-by-position (the
-structured, precise match set is listed first; CLIP's broader recall fills
-in after), not a new scoring mechanism.
+History, for context on why the prompt below reads the way it does
+(2026-09): an earlier version buried "check the sidecar for landmarks/
+counts too" as one bullet among several under "How to work." Live testing
+showed this was NOT reliably followed by Haiku — one test used ONLY CLIP
+for a named-landmark query and never touched the sidecar at all. That was
+fixed by promoting the idea to a standalone, prominent principle
+("STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY") — which then surfaced a
+SECOND failure mode in further testing: the model would sometimes call
+run_readonly_sidecar_sql but skip search_photos, or call both but skip the
+combine_results union. Given TWO distinct sequencing failures on the same
+underlying instruction, the actual fix moved into code instead:
+run_readonly_sidecar_sql now performs its own CLIP pairing internally (see
+sql_tool.py's execute_run_readonly_sidecar_sql) — the model calls one tool
+and gets one already-combined handle back, so there's no multi-step
+sequence left for it to get wrong for that specific case. AGENT_MODEL was
+also escalated to Sonnet at the same time (see config.py) as a
+complementary, not competing, fix. The prompt below is simplified
+accordingly — it no longer instructs the model to manually pair sidecar
+queries with search_photos, since that no longer needs to happen at the
+prompt level.
 """
 
 import json
@@ -94,31 +98,13 @@ id and search; do not stop to ask what kind of photos are wanted. If a query \
 is genuinely ambiguous, pick the most likely reading, run the search, and note \
 the assumption in finalize_search's explanation.
 
-STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY — CHECK BOTH:
-search_photos' object_query runs on CLIP, a broad visual-similarity embedding. \
-CLIP is excellent for open-ended scene/object description ("sunset over \
-water", "a dog") but UNRELIABLE for confirming a SPECIFIC named thing — it can \
-be fooled by anything that merely looks similar. Whenever a query names \
-something a structured tool could CONFIRM precisely — a specific named \
-landmark or monument, a specific object/animal COUNT, a county or other \
-fine-grained place, a person, exact text in the photo — do NOT rely on \
-search_photos alone, even though phrasing it as object_query looks like an \
-easy fit. Instead:
-  1. Run search_photos for broad recall (object_query, or a pure metadata \
-search if no visual description applies).
-  2. ALSO run the structured tool that can confirm the specific claim — \
-run_readonly_sql for people/OCR/precise Immich-side facts, \
-run_readonly_sidecar_sql for named landmarks/object counts/county-level \
-place (see that tool's own description for exactly what it covers).
-  3. combine_results(base_handle=<the STRUCTURED handle>, \
-filter_handles=[<the search_photos handle>], mode='union'). This lists \
-confirmed, precise matches FIRST, with CLIP's broader results filling in \
-after — do not skip step 1 just because step 2 found something, and do not \
-skip step 2 just because search_photos already returned results for a \
-plausible-sounding object_query.
-This is a general principle, not a fixed list — apply it to ANY query naming \
-something structured data could confirm, including sidecar tables added \
-after this prompt was written.
+WHEN A QUERY NAMES A SPECIFIC LANDMARK, AN OBJECT/ANIMAL COUNT, OR A COUNTY: \
+these are things CLIP (visual similarity) is unreliable for confirming \
+precisely — it can be fooled by anything that merely looks similar, and \
+cannot count. Use run_readonly_sidecar_sql for these — it already handles \
+broadening the search with CLIP internally and returns ONE combined handle; \
+you do not need to also call search_photos or combine_results yourself for \
+this part. Just call run_readonly_sidecar_sql and use the handle it gives you.
 
 How to work:
 - To filter by a person, resolve their name to a person UUID first: call \
@@ -153,26 +139,23 @@ nothing; use one cities:any search, or union the per-city handles.
 nobody else", text visible in the image, geo proximity — use run_readonly_sql \
 to SELECT the photo set (it returns a handle).
 - For a NAMED LANDMARK, an object/animal COUNT, or county-level location, see \
-"STRUCTURED DATA BEATS FUZZY VISUAL SIMILARITY" above — run BOTH search_photos \
-AND run_readonly_sidecar_sql, then union them with the sidecar handle as base. \
-run_readonly_sidecar_sql is a SEPARATE database from run_readonly_sql and \
-cannot be joined against it in a single query — if a request needs a sidecar \
-fact AND an Immich-side fact (e.g. "photos of Kevin at a landmark"), run one \
-query against each and combine their handles with combine_results.
+the paragraph above — call run_readonly_sidecar_sql alone; it handles CLIP \
+pairing internally. run_readonly_sidecar_sql IS a SEPARATE database from \
+run_readonly_sql and cannot be joined against it in a single query — if a \
+request needs a sidecar fact AND an Immich-side fact together (e.g. "photos \
+of Kevin at a landmark"), run one query against each and combine THEIR two \
+handles with combine_results yourself (this is the one case where you still \
+need to call combine_results involving a sidecar handle).
 - combine_results merges result-set handles with mode 'union' (base OR any \
-filter — e.g. beach photos plus mountain photos, a confirmed landmark match \
-plus CLIP's broader recall, or Manhattan photos plus Edgewater photos), \
-'intersect' (base AND all filters — e.g. beach photos that are ALSO \
-only-Kevin-in-frame, or a person's photos AND a landmark match), or \
+filter — e.g. beach photos plus mountain photos, or Manhattan photos plus \
+Edgewater photos), 'intersect' (base AND all filters — e.g. beach photos that \
+are ALSO only-Kevin-in-frame, or a person's photos AND a landmark match), or \
 'subtract' (base minus the filters). Do NOT merge photo ids yourself — you \
 don't have them; use combine_results. Pick the mode deliberately: \
-alternatives/OR -> union; narrowing/AND -> intersect. This is also how \
-results from the two different SQL tools get combined — combine_results \
-works on any handle regardless of which tool produced it.
-- Prefer the fewest tool calls that answer the query correctly, but do NOT \
-sacrifice the structured-data check above for the sake of fewer calls — a \
-named-landmark or count query is not "simple" just because object_query looks \
-like it would work.
+alternatives/OR -> union; narrowing/AND -> intersect.
+- Prefer the fewest tool calls that answer the query correctly. A simple \
+object search with no person/place/date/landmark/count is one search_photos \
+call, then finalize_search.
 
 A zero-result search means only that nothing matched THIS query — never state \
 or imply that the library is empty or unindexed. Just report that no photos \
@@ -229,8 +212,13 @@ def run_search_agent(query_text, immich, claude_client):
                 store, claude_client=claude_client, **kw
             )
         if config.AGENT_SIDECAR_SQL_ENABLED:
+            # immich + query_text passed here, NOT part of the tool schema
+            # the model sees — see sql_tool.py's execute_run_readonly_sidecar_sql
+            # docstring. This is what lets that function auto-pair its
+            # result with a CLIP search of the ORIGINAL user query text
+            # (not the SQL-generation sub-request the model crafts).
             executors["run_readonly_sidecar_sql"] = lambda **kw: sql_tool.execute_run_readonly_sidecar_sql(
-                store, claude_client=claude_client, **kw
+                store, claude_client=claude_client, immich=immich, original_query=query_text, **kw
             )
 
     messages = [{"role": "user", "content": query_text}]

@@ -33,11 +33,27 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Models are PINNED, not auto-"latest": SQL/tool correctness is prompt-
 # sensitive, so model moves must be deliberate and followed by re-running the
-# structured test list. Two separate vars so the SQL step can be escalated
-# (Haiku -> Sonnet) independently of the orchestrator; today both default to
-# Haiku. Current escalation target as of 2026-07: claude-sonnet-5.
+# structured test list. Two separate vars so either can move independently.
+#
+# AGENT_MODEL escalated Haiku -> Sonnet 2026-09, based on CONFIRMED live
+# failures, not a hunch: with Haiku, the sidecar-wiring test queries showed
+# two distinct multi-step-sequencing failures in one test session (skipping
+# the mandatory combine_results union step once, skipping search_photos
+# entirely another time), despite an explicit, prominent prompt instruction
+# covering both cases. This is a well-documented Haiku-vs-Sonnet gap for
+# mandatory multi-step tool sequencing specifically (not SQL correctness,
+# which is a separate, apparently still-fine-on-Haiku concern — see
+# SQL_MODEL below). If a future cost/latency review wants to reconsider
+# Haiku for AGENT_MODEL, re-run the structured test list AND specifically
+# the sidecar-pairing test queries in docs/sidecar-augmentation.md,
+# "Wiring the side-car into the search agent" before reverting.
+#
+# SQL_MODEL stays on Haiku — no evidence yet it needs escalation; it does
+# one bounded task (generate a single SELECT) rather than multi-step
+# sequencing, and every SQL generation seen so far (Immich-side and
+# sidecar-side) has been syntactically and semantically correct.
 # NB: the Haiku id's date suffix is mandatory — "claude-haiku-4-5" alone fails.
-AGENT_MODEL = os.environ.get("AGENT_MODEL", "claude-haiku-4-5-20251001")
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "claude-sonnet-5")
 SQL_MODEL = os.environ.get("SQL_MODEL", "claude-haiku-4-5-20251001")
 
 # Loop bounds. The wall-clock timeout is independent of Gunicorn's --timeout
@@ -75,11 +91,17 @@ AGENT_SIDECAR_SQL_ENABLED = os.environ.get("AGENT_SIDECAR_SQL_ENABLED", "false")
 # (sidecar). Each DSN's role must have SELECT on only that database's search
 # allowlist and nothing else — the DSN is the security boundary, the
 # in-process checks in sql_tool.py are defence in depth.
+#
+# Password note (real incident, 2026-09): keep this password ALPHANUMERIC
+# ONLY. It has to survive shell quoting (the ALTER ROLE command), .env file
+# parsing, AND URL parsing inside this DSN string itself — a symbol like
+# @, :, /, #, %, or ? in the password is ambiguous with the DSN URL's own
+# delimiters. `openssl rand -hex 24` is a good source for a safe value.
 SQL_READONLY_DSN = os.environ.get("SQL_READONLY_DSN", "")
 
 # Unset by default — see AGENT_SIDECAR_SQL_ENABLED above. Set on
 # search-api-dev once sql/create_sidecar_readonly_role.sql has been run
-# against sidecar_dev.
+# against sidecar_dev. Same alphanumeric-only password note applies.
 SIDECAR_SQL_READONLY_DSN = os.environ.get("SIDECAR_SQL_READONLY_DSN", "")
 
 # Hard cap on rows returned to the model (context + cost control). Shared by
